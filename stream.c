@@ -1075,7 +1075,7 @@ static MMAL_CONNECTION_T *hdmi_connection[4] = {0};
 static MMAL_PARAMETER_CAMERA_RX_CONFIG_T rx_cfg = {{MMAL_PARAMETER_CAMERA_RX_CONFIG, sizeof(rx_cfg)}};
 static MMAL_PARAMETER_CAMERA_RX_TIMING_T rx_timing = {{MMAL_PARAMETER_CAMERA_RX_TIMING, sizeof(rx_timing)}};
 static int i2c_fd;
-static int hdmi_running = 0;
+static int hdmi_running = 0, hdmi_frame_skip = 0;
 static unsigned int hdmi_width, hdmi_height, hdmi_fps, hdmi_frame_interval;
 static unsigned int hdmi_frame_width, hdmi_frame_height;
 
@@ -1095,7 +1095,7 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
    //printf("Buffer %p returned, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
    int bytes_written = buffer->length;
 
-   if(buffer->length == 1382400) { //1280x720
+   if(buffer->length == 1382400 && hdmi_frame_skip++ % 2) { //1280x720
      printf(",");
      cam_fill_buffer_done_mmal(buffer);
    }
@@ -4027,19 +4027,19 @@ static void cam_fill_buffer_done_mmal(MMAL_BUFFER_HEADER_T *mbuf) {
           }
         }
 
-        //if (is_audio_recording_started == 1) {
+        if (is_audio_recording_started == 1) {
           if (video_pending_drop_frames > 0) {
             log_info("dV");
             video_pending_drop_frames--;
           } else {
             log_info(".");
-          //  timestamp_update();
-          //  subtitle_update();
+            timestamp_update();
+            subtitle_update();
           //  int is_text_changed = text_draw_all(last_video_buffer, video_width_32, video_height_16, 1); // is_video = 1
             encode_and_send_image(mbuf);
             log_info("!");
           }
-      //  }
+        }
 
   if (keepRunning) {
 
@@ -5118,7 +5118,6 @@ static int video_encode_startup() {
 
   log_info("Set video_encode state to executing\n");
   // Set video_encode component to executing state
-  hdmi_running = 1;
   ilclient_change_component_state(video_encode, OMX_StateExecuting);
   log_info("Done set video_encode state to executing\n");
   return 0;
@@ -6806,13 +6805,13 @@ int main(int argc, char **argv) {
   }
 
   // Print a warning if the video size is larger than 1280x720
-  if (video_width * video_height > 1280 * 720) {
+  if (video_width * video_height >= 1280 * 720) {
     if (strcmp(video_avc_profile, "high") != 0 || strcmp(video_avc_level, "4") != 0) {
       log_info("using AVC High Profile Level 4\n");
       snprintf(video_avc_profile, sizeof(video_avc_profile), "high");
       snprintf(video_avc_level, sizeof(video_avc_level), "4");
     }
-    if (!is_vfr_enabled && video_fps > 20.0f) {
+    if (!is_vfr_enabled && (video_fps > 20.0f || hdmi_fps > 20)) {
       log_warn("warn: fps > 20 might not work properly when width and height is large.\n");
       log_warn("      Use lower --fps or use --vfr. If you still want to use this\n");
       log_warn("      configuration, see if picam keeps up with %.1f fps using --verbose.\n", video_fps);
@@ -7002,7 +7001,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  vcos_sleep(5000);
+  vcos_sleep(500);
   printf("Encoder startup...\n");
   ret = video_encode_startup();
   if (ret != 0) {
