@@ -1129,6 +1129,57 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
 
 }
 
+static void hdmi_connection_disable()
+{
+  log_debug("hdmi_connection_disable()");
+  mmal_connection_disable(hdmi_connection[0]);
+  mmal_connection_destroy(hdmi_connection[0]);
+
+  mmal_connection_disable(hdmi_connection[1]);
+  mmal_connection_destroy(hdmi_connection[1]);
+
+  mmal_connection_disable(hdmi_connection[2]);
+  mmal_connection_destroy(hdmi_connection[2]);
+}
+
+static void hdmi_component_disable()
+{
+  log_debug("hdmi_component_disable()");
+  hdmi_status = mmal_component_disable(hdmi_rawcam);
+  if(hdmi_status != MMAL_SUCCESS)
+  {
+     log_error("Failed to disable rawcam");
+  }
+
+  hdmi_status = mmal_component_disable(hdmi_isp);
+  if(hdmi_status != MMAL_SUCCESS)
+  {
+     log_error("Failed to disable isp");
+  }
+
+  hdmi_status = mmal_component_disable(hdmi_render);
+  if(hdmi_status != MMAL_SUCCESS)
+  {
+     log_error("Failed to disable render");
+  }
+
+  hdmi_status = mmal_component_disable(hdmi_splitter);
+  if(hdmi_status != MMAL_SUCCESS)
+  {
+     log_error("Failed to disable splitter");
+  }
+
+}
+
+static void hdmi_component_destroy() {
+  log_debug("hdmi_component_destroy()");
+  mmal_component_destroy(hdmi_rawcam);
+  mmal_component_destroy(hdmi_isp);
+  mmal_component_destroy(hdmi_render);
+  mmal_component_destroy(hdmi_splitter);
+  close(i2c_fd);
+}
+
 static int setup_hdmi_input() {
 
   i2c_fd = open(i2c_device_path, O_RDWR);
@@ -3928,6 +3979,10 @@ static void cam_fill_buffer_done_mmal(MMAL_BUFFER_HEADER_T *mbuf) {
       video_encode_input_buf->pBuffer = video_encode_input_buf_pBuffer_orig;
     }
 #endif
+
+    hdmi_connection_disable();
+    hdmi_component_disable();
+    hdmi_component_destroy();
 
     // Notify the main thread that the camera is stopped
     pthread_mutex_lock(&camera_finish_mutex);
