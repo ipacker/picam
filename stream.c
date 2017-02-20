@@ -1082,7 +1082,7 @@ static int hdmi_running = 0, hdmi_frame_skip = 0;
 static unsigned int hdmi_width, hdmi_height, hdmi_fps, hdmi_frame_interval;
 static unsigned int hdmi_frame_width, hdmi_frame_height, hdmi_expected_frame_bytes;
 
-#define vcos_log_error printf
+#define vcos_log_error log_info
 
 /**
  *  buffer header callback function for encoder
@@ -1294,8 +1294,7 @@ static int setup_hdmi_input() {
 
   log_info("Frame w x h is %u x %u\n", hdmi_frame_width, hdmi_frame_height);
 
-
-
+  video_fps = (hdmi_fps < 35) ? hdmi_fps : (hdmi_fps/2);
 
   hdmi_output->format->es->video.crop.width = hdmi_width;
   hdmi_output->format->es->video.crop.height = hdmi_height;
@@ -1328,13 +1327,13 @@ static int setup_hdmi_input() {
   // ISP output port does not follow input, so do have to set that one up.
   mmal_format_copy(hdmi_isp_output->format, hdmi_isp_input->format);
   hdmi_isp_output->format->encoding = MMAL_ENCODING_I420;
-  vcos_log_error("Setting isp output port format\n");
+  log_debug("Setting isp output port format\n");
   hdmi_status = mmal_port_format_commit(hdmi_isp_output);
   hdmi_isp_output->buffer_size = hdmi_isp_output->buffer_size_recommended;
   hdmi_isp_output->buffer_num = hdmi_isp_output->buffer_num_recommended;
   if (hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to create connection status %d: rawcam->isp\n", hdmi_status);
+     log_error("Failed to create connection status %d: rawcam->isp\n", hdmi_status);
      goto component_disable;
   }
 
@@ -4690,7 +4689,7 @@ static int video_encode_startup() {
   int r;
   int i;
 
-  printf("ilclient_init()\n");
+  log_debug("ilclient_init()\n");
 
   ilclient = ilclient_init();
   if (ilclient == NULL) {
@@ -4698,7 +4697,7 @@ static int video_encode_startup() {
     return -1;
   }
 
-  printf("video_encode_startup()\n");
+  log_debug("video_encode_startup()\n");
 
   // create video_encode component
   r = ilclient_create_component(ilclient, &video_encode, "video_encode",
@@ -4725,7 +4724,7 @@ static int video_encode_startup() {
   print_def(portdef);
 
   if(is_hdmi_enabled) {
-    printf("Using HDMI details for encoder (%dx%d @ %dfps)...\n", hdmi_width,
+    log_info("Using HDMI details for encoder (%dx%d @ %dfps)...\n", hdmi_width,
             hdmi_height, hdmi_fps);
     portdef.format.video.nFrameWidth = hdmi_width;
     portdef.format.video.nFrameHeight = hdmi_height;
@@ -6717,7 +6716,7 @@ int main(int argc, char **argv) {
     }
   }
   if (video_gop_size == video_gop_size_default) {
-    video_gop_size = ceil(video_fps);
+    video_gop_size = ceil(video_fps*2);
   }
   mpegts_set_config(video_bitrate, video_width, video_height);
   audio_min_value = (int) (-32768 / audio_volume_multiply);
