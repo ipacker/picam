@@ -1077,12 +1077,9 @@ static MMAL_CONNECTION_T *hdmi_connection[4] = {0};
 static MMAL_PARAMETER_CAMERA_RX_CONFIG_T rx_cfg = {{MMAL_PARAMETER_CAMERA_RX_CONFIG, sizeof(rx_cfg)}};
 static MMAL_PARAMETER_CAMERA_RX_TIMING_T rx_timing = {{MMAL_PARAMETER_CAMERA_RX_TIMING, sizeof(rx_timing)}};
 static int i2c_fd;
-static char *i2c_device = "/dev/i2c-0";
 static int hdmi_running = 0, hdmi_frame_skip = 0;
 static unsigned int hdmi_width, hdmi_height, hdmi_fps, hdmi_frame_interval;
 static unsigned int hdmi_frame_width, hdmi_frame_height, hdmi_expected_frame_bytes;
-
-#define vcos_log_error log_info
 
 /**
  *  buffer header callback function for encoder
@@ -1117,21 +1114,21 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
 
       if (bytes_written != buffer->length)
       {
-         vcos_log_error("Failed to write buffer data (%d from %d)- aborting", bytes_written, buffer->length);
+         log_error("Failed to write buffer data (%d from %d)- aborting\n", bytes_written, buffer->length);
       }
 
       mmal_buffer_header_release(buffer);
       status = mmal_port_send_buffer(port, buffer);
       if(status != MMAL_SUCCESS)
       {
-         vcos_log_error("mmal_port_send_buffer failed on buffer %p, status %d", buffer, status);
+         log_error("mmal_port_send_buffer failed on buffer %p, status %d\n", buffer, status);
       }
 
 }
 
 static void hdmi_connection_disable()
 {
-  log_debug("hdmi_connection_disable()");
+  log_debug("hdmi_connection_disable()\n");
   mmal_connection_disable(hdmi_connection[0]);
   mmal_connection_destroy(hdmi_connection[0]);
 
@@ -1144,35 +1141,35 @@ static void hdmi_connection_disable()
 
 static void hdmi_component_disable()
 {
-  log_debug("hdmi_component_disable()");
+  log_debug("hdmi_component_disable()\n");
   hdmi_status = mmal_component_disable(hdmi_rawcam);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     log_error("Failed to disable rawcam");
+     log_error("Failed to disable rawcam\n");
   }
 
   hdmi_status = mmal_component_disable(hdmi_isp);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     log_error("Failed to disable isp");
+     log_error("Failed to disable isp\n");
   }
 
   hdmi_status = mmal_component_disable(hdmi_render);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     log_error("Failed to disable render");
+     log_error("Failed to disable render\n");
   }
 
   hdmi_status = mmal_component_disable(hdmi_splitter);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     log_error("Failed to disable splitter");
+     log_error("Failed to disable splitter\n");
   }
 
 }
 
 static void hdmi_component_destroy() {
-  log_debug("hdmi_component_destroy()");
+  log_debug("hdmi_component_destroy()\n");
   mmal_component_destroy(hdmi_rawcam);
   mmal_component_destroy(hdmi_isp);
   mmal_component_destroy(hdmi_render);
@@ -1185,43 +1182,41 @@ static int setup_hdmi_input() {
   i2c_fd = open(i2c_device_path, O_RDWR);
   if (!i2c_fd)
   {
-     log_error("Couldn't open I2C device: %s", i2c_device_path);
-     return -1;
+     log_fatal("Couldn't open I2C device: %s\n", i2c_device_path);
+     exit(EXIT_FAILURE);
   }
   if(ioctl(i2c_fd, I2C_SLAVE, 0x0F) < 0)
   {
-     log_error("Failed to set I2C address");
-     return -1;
+     log_fatal("Failed to set I2C address\n");
+     exit(EXIT_FAILURE);
   }
 
   hdmi_status = mmal_component_create("vc.ril.rawcam", &hdmi_rawcam);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     log_error("Failed to create rawcam");
-     return -1;
+     log_fatal("Failed to create rawcam\n");
+     exit(EXIT_FAILURE);
   }
   hdmi_status = mmal_component_create("vc.ril.video_render", &hdmi_render);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     log_error("Failed to create render");
-     return -1;
+     log_fatal("Failed to create render\n");
+     exit(EXIT_FAILURE);
   }
 
   hdmi_status = mmal_component_create("vc.ril.isp", &hdmi_isp);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     log_error("Failed to create isp");
-     return -1;
+     log_fatal("Failed to create isp\n");
+     exit(EXIT_FAILURE);
   }
 
   hdmi_status = mmal_component_create("vc.ril.video_splitter", &hdmi_splitter);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     log_error("Failed to create isp");
-     return -1;
+     log_fatal("Failed to create isp\n");
+     exit(EXIT_FAILURE);
   }
-
-  loop:
 
   hdmi_output = hdmi_rawcam->output[0];
   hdmi_isp_input = hdmi_isp->input[0];
@@ -1233,8 +1228,9 @@ static int setup_hdmi_input() {
   hdmi_status = mmal_port_parameter_get(hdmi_output, &rx_cfg.hdr);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     log_error("Failed to get cfg");
-     goto component_destroy;
+     log_fatal("Failed to get cfg");
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
   rx_cfg.image_id = CSI_IMAGE_ID;
 
@@ -1262,7 +1258,8 @@ static int setup_hdmi_input() {
   if(hdmi_status != MMAL_SUCCESS)
   {
      log_error("Failed to set cfg");
-     goto component_destroy;
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
 
   log_debug("Enable rawcam....");
@@ -1271,13 +1268,16 @@ static int setup_hdmi_input() {
   if(hdmi_status != MMAL_SUCCESS)
   {
      log_error("Failed to enable");
-     goto component_destroy;
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
   hdmi_status = mmal_port_parameter_set_boolean(hdmi_output, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
   if(hdmi_status != MMAL_SUCCESS)
   {
      log_error("Failed to set zero copy");
-     goto component_disable;
+     hdmi_component_disable();
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
 
   // end setup rawcam
@@ -1288,13 +1288,16 @@ static int setup_hdmi_input() {
   if(hdmi_status != MMAL_SUCCESS)
   {
      log_error("Failed to enable");
-     goto component_destroy;
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
   hdmi_status = mmal_port_parameter_set_boolean(hdmi_isp_output, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
   if(hdmi_status != MMAL_SUCCESS)
   {
      log_error("Failed to set zero copy");
-     goto component_disable;
+     hdmi_component_disable();
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
 
   log_debug("Enable splitter....");
@@ -1303,13 +1306,16 @@ static int setup_hdmi_input() {
   if(hdmi_status != MMAL_SUCCESS)
   {
      log_error("Failed to enable");
-     goto component_destroy;
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
   hdmi_status = mmal_port_parameter_set_boolean(hdmi_splitter->output[0], MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
   if(hdmi_status != MMAL_SUCCESS)
   {
      log_error("Failed to set zero copy");
-     goto component_disable;
+     hdmi_component_disable();
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
 
   start_camera_streaming(i2c_fd);
@@ -1360,7 +1366,9 @@ static int setup_hdmi_input() {
   {
      log_error("output: Failed port_format_commit");
      //mmal_log_dump_port(hdmi_output);
-     goto component_disable;
+     hdmi_component_disable();
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
 
   hdmi_output->buffer_size = hdmi_output->buffer_size_recommended;
@@ -1372,7 +1380,9 @@ static int setup_hdmi_input() {
   if(hdmi_status != MMAL_SUCCESS)
   {
      log_error("Failed to create connection status %d: rawcam->isp", hdmi_status);
-     goto component_disable;
+     hdmi_component_disable();
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
 
   // ISP output port does not follow input, so do have to set that one up.
@@ -1385,7 +1395,9 @@ static int setup_hdmi_input() {
   if (hdmi_status != MMAL_SUCCESS)
   {
      log_error("Failed to create connection status %d: rawcam->isp\n", hdmi_status);
-     goto component_disable;
+     hdmi_component_disable();
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
 
   //  Encoder setup
@@ -1394,7 +1406,9 @@ static int setup_hdmi_input() {
   if(hdmi_status != MMAL_SUCCESS)
   {
      log_error("Failed to create connection status %d: isp->splitter", hdmi_status);
-     goto component_disable;
+     hdmi_component_disable();
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
 
   log_debug("Create connection splitter output to render input....\n");
@@ -1402,14 +1416,18 @@ static int setup_hdmi_input() {
   if(hdmi_status != MMAL_SUCCESS)
   {
      log_error("Failed to create connection status %d: splitter->render", hdmi_status);
-     goto component_disable;
+     hdmi_component_disable();
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
 
   hdmi_status = mmal_port_parameter_set_boolean(hdmi_input, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
   if(hdmi_status != MMAL_SUCCESS)
   {
      log_error("Failed to set zero copy on video_render");
-     goto component_disable;
+     hdmi_component_disable();
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
 
   if (hdmi_status == MMAL_SUCCESS)
@@ -1442,18 +1460,23 @@ static int setup_hdmi_input() {
 
   //Create splitter output buffers
 
-  vcos_log_error("Create pool of %d buffers of size %d\n", hdmi_splitter_output2->buffer_num, hdmi_splitter_output2->buffer_size);
+  log_debug("Create pool of %d buffers of size %d\n", hdmi_splitter_output2->buffer_num, hdmi_splitter_output2->buffer_size);
   hdmi_pool = mmal_port_pool_create(hdmi_splitter_output2, hdmi_splitter_output2->buffer_num, hdmi_splitter_output2->buffer_size);
   if(!hdmi_pool)
   {
      log_error("Failed to create hdmi_splitter_output2 pool");
-     //goto component_disable;
+     hdmi_component_disable();
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
 
   hdmi_status = mmal_port_enable(hdmi_splitter_output2, encoder_buffer_callback);
   if(hdmi_status != MMAL_SUCCESS)
   {
      log_error("Failed to enable port");
+     hdmi_component_disable();
+     hdmi_component_destroy();
+     exit(EXIT_FAILURE);
   }
 
   //running = 1;
@@ -1465,13 +1488,19 @@ static int setup_hdmi_input() {
      if (!buffer)
      {
         log_error("Where'd my buffer go?!");
-        //goto port_disable;
+        hdmi_connection_disable();
+        hdmi_component_disable();
+        hdmi_component_destroy();
+        exit(EXIT_FAILURE);
      }
      hdmi_status = mmal_port_send_buffer(hdmi_splitter_output2, buffer);
      if(hdmi_status != MMAL_SUCCESS)
      {
         log_error("mmal_port_send_buffer failed on buffer %p, status %d", buffer, hdmi_status);
-        //goto port_disable;
+        hdmi_connection_disable();
+        hdmi_component_disable();
+        hdmi_component_destroy();
+        exit(EXIT_FAILURE);
      }
      log_debug("Sent buffer %p", buffer);
   }
@@ -1481,10 +1510,7 @@ static int setup_hdmi_input() {
   log_info("CSI HDMI Setup done - start streaming...\n");
   write_regs(i2c_fd, cmds3, NUM_REGS_CMD3);
 
-  component_disable:
-  port_disable:
-  component_destroy:
-  return -1;
+  return 0;
 }
 
 // END TC
@@ -3721,8 +3747,10 @@ static void shutdown_openmax() {
   }
 
   // Disable port buffers
-  log_debug("shutdown_openmax: disable port buffer for camera %d\n", CAMERA_CAPTURE_PORT);
-  ilclient_disable_port_buffers(camera_component, CAMERA_CAPTURE_PORT, NULL, NULL, NULL);
+  if(!is_hdmi_enabled) {
+    log_debug("shutdown_openmax: disable port buffer for camera %d\n", CAMERA_CAPTURE_PORT);
+    ilclient_disable_port_buffers(camera_component, CAMERA_CAPTURE_PORT, NULL, NULL, NULL);
+  }
   log_debug("shutdown_openmax: disable port buffer for video_encode %d\n", VIDEO_ENCODE_INPUT_PORT);
   ilclient_disable_port_buffers(video_encode, VIDEO_ENCODE_INPUT_PORT, NULL, NULL, NULL);
   log_debug("shutdown_openmax: disable port buffer for video_encode %d\n", VIDEO_ENCODE_OUTPUT_PORT);
@@ -3979,10 +4007,6 @@ static void cam_fill_buffer_done_mmal(MMAL_BUFFER_HEADER_T *mbuf) {
       video_encode_input_buf->pBuffer = video_encode_input_buf_pBuffer_orig;
     }
 #endif
-
-    hdmi_connection_disable();
-    hdmi_component_disable();
-    hdmi_component_destroy();
 
     // Notify the main thread that the camera is stopped
     pthread_mutex_lock(&camera_finish_mutex);
@@ -5420,18 +5444,20 @@ static void stop_openmax_capturing() {
     stop_openmax_clock();
   }
 
-  memset(&boolean, 0, sizeof(OMX_CONFIG_PORTBOOLEANTYPE));
-  boolean.nSize = sizeof(OMX_CONFIG_PORTBOOLEANTYPE);
-  boolean.nVersion.nVersion = OMX_VERSION;
-  boolean.nPortIndex = CAMERA_CAPTURE_PORT;
-  boolean.bEnabled = OMX_FALSE;
+  if(!is_hdmi_enabled) {
+    memset(&boolean, 0, sizeof(OMX_CONFIG_PORTBOOLEANTYPE));
+    boolean.nSize = sizeof(OMX_CONFIG_PORTBOOLEANTYPE);
+    boolean.nVersion.nVersion = OMX_VERSION;
+    boolean.nPortIndex = CAMERA_CAPTURE_PORT;
+    boolean.bEnabled = OMX_FALSE;
 
-  log_debug("stop capturing video\n");
-  error = OMX_SetParameter(ILC_GET_HANDLE(camera_component),
-      OMX_IndexConfigPortCapturing, &boolean);
-  if (error != OMX_ErrorNone) {
-    log_fatal("error: failed to stop capturing video: 0x%x\n", error);
-    exit(EXIT_FAILURE);
+    log_debug("stop capturing video\n");
+    error = OMX_SetParameter(ILC_GET_HANDLE(camera_component),
+        OMX_IndexConfigPortCapturing, &boolean);
+    if (error != OMX_ErrorNone) {
+      log_fatal("error: failed to stop capturing video: 0x%x\n", error);
+      exit(EXIT_FAILURE);
+    }
   }
 }
 
@@ -7109,6 +7135,11 @@ int main(int argc, char **argv) {
     }
     pthread_mutex_unlock(&camera_finish_mutex);
   }
+
+
+  hdmi_connection_disable();
+  hdmi_component_disable();
+  hdmi_component_destroy();
 
   stop_openmax_capturing();
   if (is_preview_enabled) {
