@@ -930,19 +930,6 @@ void write_regs(int fd, struct cmds_t *regs, int count)
 
 void start_camera_streaming(int fd)
 {
-   #ifdef DO_PIN_CONFIG
-      wiringPiSetupGpio();
-      pinModeAlt(0, INPUT);
-      pinModeAlt(1, INPUT);
-      //Toggle these pin modes to ensure they get changed.
-      pinModeAlt(28, INPUT);
-      pinModeAlt(28, 4);   //Alt0
-      pinModeAlt(29, INPUT);
-      pinModeAlt(29, 4);   //Alt0
-      digitalWrite(41, 1); //Shutdown pin on B+ and Pi2
-      digitalWrite(32, 1); //LED pin on B+ and Pi2
-   #endif
-
    #define ENABLE_DATALANE_1 0x0
    #define DISABLE_DATALANE_1 0x1
 
@@ -1075,10 +1062,6 @@ static unsigned int hdmi_frame_width, hdmi_frame_height, hdmi_expected_frame_byt
 void stop_camera_streaming()
 {
    write_regs(i2c_fd, stop_cmds, NUM_REGS_STOP);
-#ifdef DO_PIN_CONFIG
-   digitalWrite(41, 0); //Shutdown pin on B+ and Pi2
-   digitalWrite(32, 0); //LED pin on B+ and Pi2
-#endif
 }
 
 /**
@@ -7027,7 +7010,7 @@ int main(int argc, char **argv) {
       log_debug("Init HLS...\n");
       hls->dir = hls_output_dir;
       hls->target_duration = 1;
-      hls->num_retained_old_files = 10;
+      hls->num_retained_old_files = 45;
       if (is_hls_encryption_enabled) {
         hls->use_encryption = 1;
 
