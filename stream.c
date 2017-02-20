@@ -1060,15 +1060,6 @@ void start_camera_streaming(int fd)
    write_regs(fd, cmds2, NUM_REGS_CMD2);
 }
 
-void stop_camera_streaming(int fd)
-{
-   write_regs(fd, stop_cmds, NUM_REGS_STOP);
-#ifdef DO_PIN_CONFIG
-   digitalWrite(41, 0); //Shutdown pin on B+ and Pi2
-   digitalWrite(32, 0); //LED pin on B+ and Pi2
-#endif
-}
-
 static MMAL_COMPONENT_T *hdmi_rawcam, *hdmi_render, *hdmi_isp, *hdmi_splitter;
 static MMAL_STATUS_T hdmi_status;
 static MMAL_PORT_T *hdmi_output, *hdmi_input, *hdmi_isp_input, *hdmi_splitter_output2, *hdmi_isp_output;
@@ -1080,6 +1071,15 @@ static int i2c_fd;
 static int hdmi_running = 0, hdmi_frame_skip = 0;
 static unsigned int hdmi_width, hdmi_height, hdmi_fps, hdmi_frame_interval;
 static unsigned int hdmi_frame_width, hdmi_frame_height, hdmi_expected_frame_bytes;
+
+void stop_camera_streaming()
+{
+   write_regs(i2c_fd, stop_cmds, NUM_REGS_STOP);
+#ifdef DO_PIN_CONFIG
+   digitalWrite(41, 0); //Shutdown pin on B+ and Pi2
+   digitalWrite(32, 0); //LED pin on B+ and Pi2
+#endif
+}
 
 /**
  *  buffer header callback function for encoder
@@ -4007,6 +4007,8 @@ static void cam_fill_buffer_done_mmal(MMAL_BUFFER_HEADER_T *mbuf) {
       video_encode_input_buf->pBuffer = video_encode_input_buf_pBuffer_orig;
     }
 #endif
+
+    stop_camera_streaming();
 
     // Notify the main thread that the camera is stopped
     pthread_mutex_lock(&camera_finish_mutex);
