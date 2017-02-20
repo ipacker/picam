@@ -326,7 +326,7 @@ static const exposure_metering_option exposure_metering_options[] = {
 static void
 print_def(OMX_PARAM_PORTDEFINITIONTYPE def)
 {
-   printf("Port %u: %s %u/%u %u %u %s,%s,%s %ux%u %ux%u @%u %u\n",
+   log_debug("Port %u: %s %u/%u %u %u %s,%s,%s %ux%u %ux%u @%u %u\n",
 	  def.nPortIndex,
 	  def.eDir == OMX_DirInput ? "in" : "out",
 	  def.nBufferCountActual,
@@ -647,7 +647,7 @@ static void i2c_rd(int fd, uint16_t reg, uint8_t *values, uint32_t n)
 
    err = ioctl(fd, I2C_RDWR, &msgset);
    if(err != msgset.nmsgs)
-      printf("%s: reading register 0x%x from 0x%x failed, err %d\n",
+      log_error("%s: reading register 0x%x from 0x%x failed, err %d\n",
             __func__, reg, I2C_ADDR, err);
 }
 
@@ -659,7 +659,7 @@ static void i2c_wr(int fd, uint16_t reg, uint8_t *values, uint32_t n)
    struct i2c_rdwr_ioctl_data msgset;
 
    if ((2 + n) > sizeof(data))
-      printf("i2c wr reg=%04x: len=%d is too big!\n",
+      log_error("i2c wr reg=%04x: len=%d is too big!\n",
            reg, 2 + n);
 
    msg.addr = I2C_ADDR;
@@ -678,7 +678,7 @@ static void i2c_wr(int fd, uint16_t reg, uint8_t *values, uint32_t n)
 
    err = ioctl(fd, I2C_RDWR, &msgset);
    if (err != 1) {
-      printf("%s: writing register 0x%x from 0x%x failed\n",
+      log_error("%s: writing register 0x%x from 0x%x failed\n",
             __func__, reg, I2C_ADDR);
       return;
    }
@@ -741,7 +741,7 @@ static inline int no_signal(int fd)
 {
    int ret;
    ret = i2c_rd8(fd, SYS_STATUS);
-   printf("no_signal read %02X", ret);
+   log_info("no_signal read %02X", ret);
    return !(ret & MASK_S_TMDS);
 }
 
@@ -749,7 +749,7 @@ static inline int no_sync(int fd)
 {
    int ret;
    ret = i2c_rd8(fd, SYS_STATUS);
-   printf("no_sync read %02X", ret);
+   log_info("no_sync read %02X", ret);
    return !(ret & MASK_S_SYNC);
 }
 
@@ -920,7 +920,7 @@ void write_regs(int fd, struct cmds_t *regs, int count)
             vcos_sleep(regs[i].value);
             break;
          default:
-            printf("%u bytes specified in entry %d - not supported", regs[i].num_bytes, i);
+            log_error("%u bytes specified in entry %d - not supported", regs[i].num_bytes, i);
             break;
       }
    }
@@ -946,7 +946,7 @@ void start_camera_streaming(int fd)
 
    u8 _s_v_format = i2c_rd8(fd, VI_STATUS) & 0x0F;
 
-   printf("VI_STATUS to select cfg.data_lanes: %u", _s_v_format);
+   log_debug("VI_STATUS to select cfg.data_lanes: %u", _s_v_format);
 
    u16 r0006;
    u8 r0148;
@@ -957,14 +957,14 @@ void start_camera_streaming(int fd)
       r0006 = 0x0080;
       r0148 = DISABLE_DATALANE_1;
       r0500 = 0xA3008080;
-      printf("Selected Sub 720p registers");
+      log_debug("Selected Sub 720p registers");
    }
    else
    {
       r0006 = 0x0008;
       r0148 = ENABLE_DATALANE_1;
       r0500 = 0xA3008082;
-      printf("Selected 720p+ registers");
+      log_debug("Selected 720p+ registers");
    }
 
    struct cmds_t cmds[] =
@@ -1067,17 +1067,18 @@ void stop_camera_streaming(int fd)
 #endif
 }
 
-static MMAL_COMPONENT_T *hdmi_rawcam, *hdmi_render, *hdmi_isp, *hdmi_splitter, *hdmi_encoder;
+static MMAL_COMPONENT_T *hdmi_rawcam, *hdmi_render, *hdmi_isp, *hdmi_splitter;
 static MMAL_STATUS_T hdmi_status;
-static MMAL_PORT_T *hdmi_output, *hdmi_input, *hdmi_isp_input, *hdmi_splitter_output2, *hdmi_isp_output, *hdmi_encoder_input, *hdmi_encoder_output;
+static MMAL_PORT_T *hdmi_output, *hdmi_input, *hdmi_isp_input, *hdmi_splitter_output2, *hdmi_isp_output;
 static MMAL_POOL_T *hdmi_pool;
 static MMAL_CONNECTION_T *hdmi_connection[4] = {0};
 static MMAL_PARAMETER_CAMERA_RX_CONFIG_T rx_cfg = {{MMAL_PARAMETER_CAMERA_RX_CONFIG, sizeof(rx_cfg)}};
 static MMAL_PARAMETER_CAMERA_RX_TIMING_T rx_timing = {{MMAL_PARAMETER_CAMERA_RX_TIMING, sizeof(rx_timing)}};
 static int i2c_fd;
+static char *i2c_device = "/dev/i2c-0";
 static int hdmi_running = 0, hdmi_frame_skip = 0;
 static unsigned int hdmi_width, hdmi_height, hdmi_fps, hdmi_frame_interval;
-static unsigned int hdmi_frame_width, hdmi_frame_height;
+static unsigned int hdmi_frame_width, hdmi_frame_height, hdmi_expected_frame_bytes;
 
 #define vcos_log_error printf
 
@@ -1095,8 +1096,12 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
    //printf("Buffer %p returned, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
    int bytes_written = buffer->length;
 
-   if(buffer->length == 1382400 && hdmi_frame_skip++ % 2) { //1280x720
-     printf(",");
+   // TODO are partial buffer possible in our use-case? If yes, handle properly
+   if( (buffer->flags & 0x4) &&
+       (buffer->length == hdmi_expected_frame_bytes) &&
+       (hdmi_fps < 35 || hdmi_frame_skip++ % 2))
+   {
+     log_debug(",");
      cam_fill_buffer_done_mmal(buffer);
    }
 
@@ -1126,56 +1131,47 @@ static int setup_hdmi_input() {
   i2c_fd = open("/dev/i2c-0", O_RDWR);
   if (!i2c_fd)
   {
-     printf("Couldn't open I2C device");
+     log_error("Couldn't open I2C device");
      return -1;
   }
   if(ioctl(i2c_fd, I2C_SLAVE, 0x0F) < 0)
   {
-     printf("Failed to set I2C address");
+     log_error("Failed to set I2C address");
      return -1;
   }
 
   hdmi_status = mmal_component_create("vc.ril.rawcam", &hdmi_rawcam);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to create rawcam");
+     log_error("Failed to create rawcam");
      return -1;
   }
   hdmi_status = mmal_component_create("vc.ril.video_render", &hdmi_render);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to create render");
+     log_error("Failed to create render");
      return -1;
   }
 
   hdmi_status = mmal_component_create("vc.ril.isp", &hdmi_isp);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to create isp");
+     log_error("Failed to create isp");
      return -1;
   }
 
   hdmi_status = mmal_component_create("vc.ril.video_splitter", &hdmi_splitter);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to create isp");
+     log_error("Failed to create isp");
      return -1;
   }
-/*
-  hdmi_status = mmal_component_create("vc.ril.video_encode", &hdmi_encoder);
-  if(hdmi_status != MMAL_SUCCESS)
-  {
-     printf("Failed to create encoder");
-     return -1;
-  }
-*/
+
   loop:
 
   hdmi_output = hdmi_rawcam->output[0];
   hdmi_isp_input = hdmi_isp->input[0];
   hdmi_isp_output = hdmi_isp->output[0];
-  //hdmi_encoder_input = hdmi_encoder->input[0];
-  //hdmi_encoder_output = hdmi_encoder->output[0];
   hdmi_splitter_output2 = hdmi_splitter->output[1];
   hdmi_input = hdmi_render->input[0];
 
@@ -1183,24 +1179,23 @@ static int setup_hdmi_input() {
   hdmi_status = mmal_port_parameter_get(hdmi_output, &rx_cfg.hdr);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to get cfg");
+     log_error("Failed to get cfg");
      goto component_destroy;
   }
   rx_cfg.image_id = CSI_IMAGE_ID;
 
-
   u8 _s_v_format = i2c_rd8(i2c_fd, VI_STATUS) & 0x0F;
-  printf("VI_STATUS to select cfg.data_lanes: %u", _s_v_format);
+  log_debug("VI_STATUS to select cfg.data_lanes: %u", _s_v_format);
 
   if (_s_v_format < 12)
   {
      rx_cfg.data_lanes = 1;
-     printf("rx_cfg.data_lanes = 1");
+     log_debug("rx_cfg.data_lanes = 1");
   }
   else
   {
      rx_cfg.data_lanes = 2;
-     printf("rx_cfg.data_lanes = 2");
+     log_debug("rx_cfg.data_lanes = 2");
   }
 
 
@@ -1208,64 +1203,64 @@ static int setup_hdmi_input() {
   rx_cfg.unpack = UNPACK;
   rx_cfg.pack = PACK;
   rx_cfg.embedded_data_lines = 128;
-  printf("Set pack to %d, unpack to %d", rx_cfg.unpack, rx_cfg.pack);
+  log_debug("Set pack to %d, unpack to %d", rx_cfg.unpack, rx_cfg.pack);
   hdmi_status = mmal_port_parameter_set(hdmi_output, &rx_cfg.hdr);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to set cfg");
+     log_error("Failed to set cfg");
      goto component_destroy;
   }
 
-  printf("Enable rawcam....");
+  log_debug("Enable rawcam....");
 
   hdmi_status = mmal_component_enable(hdmi_rawcam);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to enable");
+     log_error("Failed to enable");
      goto component_destroy;
   }
   hdmi_status = mmal_port_parameter_set_boolean(hdmi_output, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to set zero copy");
+     log_error("Failed to set zero copy");
      goto component_disable;
   }
 
   // end setup rawcam
 
-  printf("Enable isp....");
+  log_debug("Enable isp....");
 
   hdmi_status = mmal_component_enable(hdmi_isp);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to enable");
+     log_error("Failed to enable");
      goto component_destroy;
   }
   hdmi_status = mmal_port_parameter_set_boolean(hdmi_isp_output, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to set zero copy");
+     log_error("Failed to set zero copy");
      goto component_disable;
   }
 
-  printf("Enable splitter....");
+  log_debug("Enable splitter....");
 
   hdmi_status = mmal_component_enable(hdmi_splitter);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to enable");
+     log_error("Failed to enable");
      goto component_destroy;
   }
   hdmi_status = mmal_port_parameter_set_boolean(hdmi_splitter->output[0], MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to set zero copy");
+     log_error("Failed to set zero copy");
      goto component_disable;
   }
 
   start_camera_streaming(i2c_fd);
   vcos_sleep(500);  //Give a chance to detect signal
-  printf("Waiting to detect signal...\n");
+  log_debug("Waiting to detect signal...\n");
 
   int count=0;
   while((count<20) && (no_sync(i2c_fd) || no_signal(i2c_fd)))
@@ -1273,7 +1268,7 @@ static int setup_hdmi_input() {
      vcos_sleep(200);
      count++;
   }
-  printf("Signal reported\n");
+  log_debug("Signal reported\n");
   hdmi_width = ((i2c_rd8(i2c_fd, DE_WIDTH_H_HI) & 0x1f) << 8) +
      i2c_rd8(i2c_fd, DE_WIDTH_H_LO);
   hdmi_height = ((i2c_rd8(i2c_fd, DE_WIDTH_V_HI) & 0x1f) << 8) +
@@ -1283,27 +1278,20 @@ static int setup_hdmi_input() {
   hdmi_frame_height = (((i2c_rd8(i2c_fd, V_SIZE_HI) & 0x3f) << 8) +
      i2c_rd8(i2c_fd, V_SIZE_LO)) / 2;
 
-
-
-
-
-/*
-  if (playthroughs == 0)
-  {
-     playthroughs++;
-     printf("First playthrough, Goto Loop");
-     goto loop;
-  }*/
-
-
   /* frame interval in milliseconds * 10
    * Require SYS_FREQ0 and SYS_FREQ1 are precisely set */
   hdmi_frame_interval = ((i2c_rd8(i2c_fd, FV_CNT_HI) & 0x3) << 8) +
      i2c_rd8(i2c_fd, FV_CNT_LO);
   hdmi_fps =  (hdmi_frame_interval > 0) ?
             (10000/hdmi_frame_interval) : 0;
-  printf("Signal is %u x %u, frm_interval %u, so %u fps\n", hdmi_width, hdmi_height, hdmi_frame_interval, hdmi_fps);
-  printf("Frame w x h is %u x %u\n", hdmi_frame_width, hdmi_frame_height);
+  hdmi_expected_frame_bytes = hdmi_width * hdmi_height * 1.5;
+  log_info("Signal is %u x %u, frm_interval %u, so %u fps, %u bytes per frame\n",
+          hdmi_width, hdmi_height, hdmi_frame_interval, hdmi_fps,
+          hdmi_expected_frame_bytes);
+
+  log_info("Frame w x h is %u x %u\n", hdmi_frame_width, hdmi_frame_height);
+
+
 
 
   hdmi_output->format->es->video.crop.width = hdmi_width;
@@ -1317,20 +1305,20 @@ static int setup_hdmi_input() {
 
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("output: Failed port_format_commit");
+     log_error("output: Failed port_format_commit");
      //mmal_log_dump_port(hdmi_output);
      goto component_disable;
   }
 
   hdmi_output->buffer_size = hdmi_output->buffer_size_recommended;
   hdmi_output->buffer_num = 3;
-  printf("output: buffer size is %d bytes, num %d\n", hdmi_output->buffer_size, hdmi_output->buffer_num);
+  log_debug("output: buffer size is %d bytes, num %d\n", hdmi_output->buffer_size, hdmi_output->buffer_num);
 
-  printf("Create connection rawcam output to isp input....\n");
+  log_debug("Create connection rawcam output to isp input....\n");
   hdmi_status =  mmal_connection_create(&hdmi_connection[0], hdmi_output, hdmi_isp_input, MMAL_CONNECTION_FLAG_TUNNELLING);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to create connection status %d: rawcam->isp", hdmi_status);
+     log_error("Failed to create connection status %d: rawcam->isp", hdmi_status);
      goto component_disable;
   }
 
@@ -1348,185 +1336,71 @@ static int setup_hdmi_input() {
   }
 
   //  Encoder setup
-  printf("Create connection isp output to splitter input....\n");
+  log_debug("Create connection isp output to splitter input....\n");
   hdmi_status =  mmal_connection_create(&hdmi_connection[1], hdmi_isp_output, hdmi_splitter->input[0], MMAL_CONNECTION_FLAG_TUNNELLING);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to create connection status %d: isp->splitter", hdmi_status);
+     log_error("Failed to create connection status %d: isp->splitter", hdmi_status);
      goto component_disable;
   }
 
-  printf("Create connection splitter output to render input....\n");
+  log_debug("Create connection splitter output to render input....\n");
   hdmi_status =  mmal_connection_create(&hdmi_connection[2], hdmi_splitter->output[0], hdmi_input, MMAL_CONNECTION_FLAG_TUNNELLING);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to create connection status %d: splitter->render", hdmi_status);
+     log_error("Failed to create connection status %d: splitter->render", hdmi_status);
      goto component_disable;
   }
-/*
-  printf("Create connection splitter output2 to encoder input....\n");
-  hdmi_status =  mmal_connection_create(&hdmi_connection[3], hdmi_splitter->output[1], hdmi_encoder_input, MMAL_CONNECTION_FLAG_TUNNELLING);
-  if(hdmi_status != MMAL_SUCCESS)
-  {
-     printf("Failed to create connection status %d: splitter->encoder", hdmi_status);
-     goto component_disable;
-  }
-
-  hdmi_encoder_output->format->encoding = MMAL_ENCODING_H264;
-
-  hdmi_encoder_output->format->bitrate = 8000000;
-  hdmi_encoder_output->buffer_size = hdmi_encoder_output->buffer_size_recommended;
-
-  if (hdmi_encoder_output->buffer_size < hdmi_encoder_output->buffer_size_min)
-     hdmi_encoder_output->buffer_size = hdmi_encoder_output->buffer_size_min;
-
-  hdmi_encoder_output->buffer_num = 8; //encoder_output->buffer_num_recommended;
-
-  if (hdmi_encoder_output->buffer_num < hdmi_encoder_output->buffer_num_min)
-     hdmi_encoder_output->buffer_num = hdmi_encoder_output->buffer_num_min;
-
-  // We need to set the frame rate on output to 0, to ensure it gets
-  // updated correctly from the input framerate when port connected
-  hdmi_encoder_output->format->es->video.frame_rate.num = hdmi_fps;//0;
-  hdmi_encoder_output->format->es->video.frame_rate.den = 1;
-
-  // Commit the port changes to the output port
-  hdmi_status = mmal_port_format_commit(hdmi_encoder_output);
-
-  if (hdmi_status != MMAL_SUCCESS)
-  {
-     printf("Unable to set format on encoder output port");
-  }*/
-/*
-  {
-     MMAL_PARAMETER_VIDEO_PROFILE_T  param;
-     param.hdr.id = MMAL_PARAMETER_PROFILE;
-     param.hdr.size = sizeof(param);
-
-     param.profile[0].profile = MMAL_VIDEO_PROFILE_H264_HIGH;//state->profile;
-     param.profile[0].level = MMAL_VIDEO_LEVEL_H264_4; // This is the only value supported
-
-     hdmi_status = mmal_port_parameter_set(hdmi_encoder_output, &param.hdr);
-     if (hdmi_status != MMAL_SUCCESS)
-     {
-        printf("Unable to set H264 profile");
-     }
-  }
-
-  if (mmal_port_parameter_set_boolean(hdmi_encoder_input, MMAL_PARAMETER_VIDEO_IMMUTABLE_INPUT, 1) != MMAL_SUCCESS)
-  {
-     printf("Unable to set immutable input flag");
-     // Continue rather than abort..
-  }
-
-  //set INLINE HEADER flag to generate SPS and PPS for every IDR if requested
-  if (mmal_port_parameter_set_boolean(hdmi_encoder_output, MMAL_PARAMETER_VIDEO_ENCODE_INLINE_HEADER, 0) != MMAL_SUCCESS)
-  {
-     printf("failed to set INLINE HEADER FLAG parameters");
-     // Continue rather than abort..
-  }
-
-  //set INLINE VECTORS flag to request motion vector estimates
-  if (mmal_port_parameter_set_boolean(hdmi_encoder_output, MMAL_PARAMETER_VIDEO_ENCODE_INLINE_VECTORS, 0) != MMAL_SUCCESS)
-  {
-     printf("failed to set INLINE VECTORS parameters");
-     // Continue rather than abort..
-  }
-
-  if (hdmi_status != MMAL_SUCCESS)
-  {
-     printf("Unable to set format on video encoder input port");
-  }
-
-  printf("Enable encoder....");
-
-  hdmi_status = mmal_component_enable(hdmi_encoder);
-  if(hdmi_status != MMAL_SUCCESS)
-  {
-     printf("Failed to enable");
-     goto component_destroy;
-  }
-  hdmi_status = mmal_port_parameter_set_boolean(hdmi_encoder_output, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
-  if(hdmi_status != MMAL_SUCCESS)
-  {
-     printf("Failed to set zero copy");
-     goto component_disable;
-  }
-*/
-  /*
-  vcos_log_error("rawcam supported encodings:");
-  display_supported_encodings(output);
-  vcos_log_error("isp input supported encodings:");
-  display_supported_encodings(isp_input);
-  vcos_log_error("isp output supported encodings:");
-  display_supported_encodings(isp_output);
-  vcos_log_error("encoder input supported encodings:");
-  display_supported_encodings(encoder_input);
-  vcos_log_error("encoder output supported encodings:");
-  display_supported_encodings(encoder_output);
-  vcos_log_error("render supported encodings:");
-  display_supported_encodings(input);
-  */
-
 
   hdmi_status = mmal_port_parameter_set_boolean(hdmi_input, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     printf("Failed to set zero copy on video_render");
+     log_error("Failed to set zero copy on video_render");
      goto component_disable;
   }
 
   if (hdmi_status == MMAL_SUCCESS)
   {
-     printf("Enable connection[0]...\n");
-     printf("buffer size is %d bytes, num %d", hdmi_output->buffer_size, hdmi_output->buffer_num);
+     log_debug("Enable connection[0]...\n");
+     log_debug("buffer size is %d bytes, num %d\n", hdmi_output->buffer_size, hdmi_output->buffer_num);
      hdmi_status =  mmal_connection_enable(hdmi_connection[0]);
      if (hdmi_status != MMAL_SUCCESS)
      {
         mmal_connection_destroy(hdmi_connection[0]);
      }
-     printf("Enable connection[1]...\n");
-     printf("buffer size is %d bytes, num %d", hdmi_isp_output->buffer_size, hdmi_isp_output->buffer_num);
+     log_debug("Enable connection[1]...\n");
+     log_debug("buffer size is %d bytes, num %d\n", hdmi_isp_output->buffer_size, hdmi_isp_output->buffer_num);
      hdmi_status =  mmal_connection_enable(hdmi_connection[1]);
      if (hdmi_status != MMAL_SUCCESS)
      {
         mmal_connection_destroy(hdmi_connection[1]);
      }
 
-     printf("Enable connection[2]...\n");
-     printf("buffer size is %d bytes, num %d", hdmi_splitter->output[0]->buffer_size,
+     log_debug("Enable connection[2]...\n");
+     log_debug("buffer size is %d bytes, num %d", hdmi_splitter->output[0]->buffer_size,
                 hdmi_splitter->output[0]->buffer_num);
      hdmi_status =  mmal_connection_enable(hdmi_connection[2]);
      if (hdmi_status != MMAL_SUCCESS)
      {
         mmal_connection_destroy(hdmi_connection[2]);
      }
-/*
-     vcos_log_error("Enable connection[3]...\n");
-     vcos_log_error("buffer size is %d bytes, num %d", hdmi_splitter->output[1]->buffer_size,
-        hdmi_splitter->output[1]->buffer_num);
-     hdmi_status =  mmal_connection_enable(hdmi_connection[3]);
-     if (hdmi_status != MMAL_SUCCESS)
-     {
-        mmal_connection_destroy(hdmi_connection[3]);
-     }*/
+
   }
 
-  // open h264 file and put the file handle in userdata for the encoder output port
-  //Create encoder output buffers
+  //Create splitter output buffers
 
   vcos_log_error("Create pool of %d buffers of size %d\n", hdmi_splitter_output2->buffer_num, hdmi_splitter_output2->buffer_size);
   hdmi_pool = mmal_port_pool_create(hdmi_splitter_output2, hdmi_splitter_output2->buffer_num, hdmi_splitter_output2->buffer_size);
   if(!hdmi_pool)
   {
-     printf("Failed to create hdmi_splitter_output2 pool");
+     log_error("Failed to create hdmi_splitter_output2 pool");
      //goto component_disable;
   }
 
   hdmi_status = mmal_port_enable(hdmi_splitter_output2, encoder_buffer_callback);
   if(hdmi_status != MMAL_SUCCESS)
   {
-     vcos_log_error("Failed to enable port");
+     log_error("Failed to enable port");
   }
 
   //running = 1;
@@ -1537,21 +1411,21 @@ static int setup_hdmi_input() {
 
      if (!buffer)
      {
-        vcos_log_error("Where'd my buffer go?!");
+        log_error("Where'd my buffer go?!");
         //goto port_disable;
      }
      hdmi_status = mmal_port_send_buffer(hdmi_splitter_output2, buffer);
      if(hdmi_status != MMAL_SUCCESS)
      {
-        vcos_log_error("mmal_port_send_buffer failed on buffer %p, status %d", buffer, hdmi_status);
+        log_error("mmal_port_send_buffer failed on buffer %p, status %d", buffer, hdmi_status);
         //goto port_disable;
      }
-     vcos_log_error("Sent buffer %p", buffer);
+     log_debug("Sent buffer %p", buffer);
   }
 
 
   // Setup complete
-  printf("All done. Start streaming...\n");
+  log_info("CSI HDMI Setup done - start streaming...\n");
   write_regs(i2c_fd, cmds3, NUM_REGS_CMD3);
 
   component_disable:
@@ -4011,7 +3885,7 @@ static void auto_select_exposure(int width, int height, uint8_t *data, float fps
 static void cam_fill_buffer_done_mmal(MMAL_BUFFER_HEADER_T *mbuf) {
 
   if(!hdmi_running) {
-    printf("Ignoring frame\n");
+    log_debug("Ignoring frame\n");
     return;
   }
 
@@ -5112,14 +4986,14 @@ static int video_encode_startup() {
 
   // Set camera component to executing state
   if(!is_hdmi_enabled) {
-    log_info("Set camera state to executing\n");
+    log_debug("Set camera state to executing\n");
     ilclient_change_component_state(camera_component, OMX_StateExecuting);
   }
 
-  log_info("Set video_encode state to executing\n");
+  log_debug("Setting video_encode state to executing\n");
   // Set video_encode component to executing state
   ilclient_change_component_state(video_encode, OMX_StateExecuting);
-  log_info("Done set video_encode state to executing\n");
+  log_debug("Done set video_encode state to executing\n");
   return 0;
 }
 
@@ -7002,14 +6876,13 @@ int main(int argc, char **argv) {
   }
 
   vcos_sleep(500);
-  printf("Encoder startup...\n");
   ret = video_encode_startup();
   if (ret != 0) {
     log_fatal("error: video_encode_startup failed: %d\n", ret);
     return ret;
   }
 
-  printf("Encoder is ready\n");
+  log_debug("Encoder is ready\n");
 
   av_log_set_level(AV_LOG_ERROR);
 
@@ -7060,7 +6933,7 @@ int main(int argc, char **argv) {
 #endif
 
     if (is_hlsout_enabled) {
-      printf("Init HLS...\n");
+      log_debug("Init HLS...\n");
       hls->dir = hls_output_dir;
       hls->target_duration = 1;
       hls->num_retained_old_files = 10;
@@ -7112,7 +6985,7 @@ int main(int argc, char **argv) {
   sigaction(SIGTERM, &int_handler, NULL);
 
   // initialize text library
-  printf("Init text lib...\n");
+  log_debug("Init text lib...\n");
   text_init();
   // setup timestamp
   if (is_timestamp_enabled) {
@@ -7144,7 +7017,7 @@ int main(int argc, char **argv) {
   if (query_and_exit) {
     query_sensor_mode();
   } else {
-    printf("Entering cam_loop()\n");
+    log_debug("Entering cam_loop()\n");
     openmax_cam_loop();
 
     if (disable_audio_capturing) {
