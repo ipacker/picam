@@ -410,6 +410,8 @@ static TEXT_ALIGN timestamp_text_align;
 static const TEXT_ALIGN timestamp_text_align_default = TEXT_ALIGN_LEFT;
 static char timestamp_font_name[128];
 static const char *timestamp_font_name_default = "FreeMono:style=Bold";
+static char i2c_device_path[32];
+static const char *i2c_device_path_default = "/dev/i2c-1";
 static char timestamp_font_file[1024];
 static int timestamp_font_face_index;
 static const int timestamp_font_face_index_default = 0;
@@ -1128,10 +1130,11 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
 }
 
 static int setup_hdmi_input() {
-  i2c_fd = open("/dev/i2c-0", O_RDWR);
+
+  i2c_fd = open(i2c_device_path, O_RDWR);
   if (!i2c_fd)
   {
-     log_error("Couldn't open I2C device");
+     log_error("Couldn't open I2C device: %s", i2c_device_path);
      return -1;
   }
   if(ioctl(i2c_fd, I2C_SLAVE, 0x0F) < 0)
@@ -5760,6 +5763,7 @@ int main(int argc, char **argv) {
     { "timevertmargin", required_argument, NULL, 0 },
     { "timepos", required_argument, NULL, 0 },
     { "timealign", required_argument, NULL, 0 },
+    { "i2cdev", required_argument, NULL, 0 },
     { "timefontname", required_argument, NULL, 0 },
     { "timefontfile", required_argument, NULL, 0 },
     { "timefontface", required_argument, NULL, 0 },
@@ -5879,7 +5883,9 @@ int main(int argc, char **argv) {
   timestamp_vertical_margin = timestamp_vertical_margin_default;
   timestamp_text_align = timestamp_text_align_default;
   strncpy(timestamp_font_name, timestamp_font_name_default, sizeof(timestamp_font_name) - 1);
+  strncpy(i2c_device_path, i2c_device_path_default, sizeof(timestamp_font_name) - 1);
   timestamp_font_name[sizeof(timestamp_font_name) - 1] = '\0';
+  i2c_device_path[sizeof(i2c_device_path)-1] = '\0';
   timestamp_font_face_index = timestamp_font_face_index_default;
   timestamp_font_points = timestamp_font_points_default;
   timestamp_font_dpi = timestamp_font_dpi_default;
@@ -6313,6 +6319,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(long_options[option_index].name, "timefontname") == 0) {
           strncpy(timestamp_font_name, optarg, sizeof(timestamp_font_name) - 1);
           timestamp_font_name[sizeof(timestamp_font_name) - 1] = '\0';
+        } else if (strcmp(long_options[option_index].name, "i2cdev") == 0) {
+          strncpy(i2c_device_path, optarg, sizeof(i2c_device_path) - 1);
+          i2c_device_path[sizeof(i2c_device_path) - 1] = '\0';
         } else if (strcmp(long_options[option_index].name, "timefontfile") == 0) {
           strncpy(timestamp_font_file, optarg, sizeof(timestamp_font_file) - 1);
           timestamp_font_file[sizeof(timestamp_font_file) - 1] = '\0';
