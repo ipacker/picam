@@ -2775,7 +2775,6 @@ static int timespec_subtract(struct timespec *result, struct timespec *t2, struc
 
 void stopSignalHandler(int signo) {
   keepRunning = 0;
-  input_capture = 0;
   log_debug("stop requested (signal=%d)\n", signo);
 }
 
@@ -3359,6 +3358,7 @@ static int openmax_cam_open() {
     cam_def.format.video.nFrameHeight = video_height;
     cam_def.format.video.eCompressionFormat = OMX_VIDEO_CodingMJPEG;
     cam_def.format.video.bFlagErrorConcealment = 0;
+    cam_def.nBufferSize = 256*1024;
 
     // Set input port def
     error = OMX_SetParameter(ILC_GET_HANDLE(video_decode),
@@ -4541,12 +4541,15 @@ static void openmax_cam_loop() {
   }
 }
 
+#define STDIN_BUFSIZE 2048*1024
+
 static void *input_thread_loop() {
   struct timespec ts;
-  int ret, k, size, nsize, offset, i;
+  int ret, k, size, offset, i, ff, end_buf, got_frame;
   OMX_BUFFERHEADERTYPE *buf;
   OMX_ERRORTYPE error;
   unsigned char test_jpeg[200000];
+  char sinbuf[STDIN_BUFSIZE+1] = {0};
   FILE *testFile;
 
   testFile = fopen(input_path, "rb");
@@ -4562,11 +4565,13 @@ static void *input_thread_loop() {
     exit(EXIT_FAILURE);
   }
   offset = 0;
+  end_buf = 0;
   i = 0;
+  ff = 0;
 
   log_debug("input_loop() forked, using: %s\n", input_path);
 
-  while (keepRunning) {
+  while (keepRunning || !is_camera_finished) {
     if (input_capture) {
       buf = ilclient_get_input_buffer(video_decode, VIDEO_DECODE_INPUT_PORT, 1);
       if (buf == NULL) {
@@ -4574,13 +4579,52 @@ static void *input_thread_loop() {
         exit(EXIT_FAILURE);
       }
 
+      buf->nFlags = i++ == 0 ? OMX_BUFFERFLAG_STARTTIME : 0;
+      k = 0;
+      got_frame = 0;
+
+      while(!got_frame && k < buf->nAllocLen) {
+        while(offset < end_buf) {
+          buf->pBuffer[k] = sinbuf[offset++];
+          if(ff && buf->pBuffer[k] == 0xD9) {
+              //log_debug("Found full jpeg after %d = %d\n", i, offset);
+              buf->nFlags |= OMX_BUFFERFLAG_ENDOFFRAME;
+              got_frame = 1;
+              goto dump_frame;
+          }
+          ff = (buf->pBuffer[k++] == 0xFF);
+          if(k >= buf->nAllocLen)
+            goto dump_frame;
+        }
+        offset = 0;
+        end_buf = fread(sinbuf, 1, STDIN_BUFSIZE, stdin);
+        if(end_buf == 0) {
+          ts.tv_sec = 0;
+          ts.tv_nsec = 35000000;
+          ret = clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
+          if (ret != 0) {
+            log_error("nanosleep error:%d\n", ret);
+          }
+        }
+        //log_debug("Read %d bytes from stdin\n", end_buf);
+      }
+      dump_frame:
+
+      //log_debug("Writing jpeg buffer %d bytes\n", k);
+      buf->nFilledLen = k;
+/*
+      if(need_more_data) {
+        chars_read = fread(sinbuf, 1, STDIN_BUFSIZE, stdin);
+      }
+*/
+
       //printf("Buffer (jpeg input) size = %d\n", buf->nAllocLen);
 
-      memcpy(buf->pBuffer, test_jpeg, size);
-      buf->nFilledLen = size;
+/*      memcpy(buf->pBuffer, test_jpeg, size);
+      buf->nFilledLen = size;*/
 
-      buf->nFlags = i++ == 0 ? OMX_BUFFERFLAG_STARTTIME : 0;
-			buf->nFlags |= OMX_BUFFERFLAG_ENDOFFRAME;
+
+
 
       // OMX_EmptyThisBuffer takes 22000-27000 usec at 1920x1080
       error = OMX_EmptyThisBuffer(ILC_GET_HANDLE(video_decode), buf);
@@ -4589,13 +4633,14 @@ static void *input_thread_loop() {
       }
       // sleep 100ms
       ts.tv_sec = 0;
-      ts.tv_nsec = 35000000;
+      ts.tv_nsec = 17000000;
       ret = clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
       if (ret != 0) {
         log_error("nanosleep error:%d\n", ret);
       }
     }
   }
+  log_debug("input loop ending\n");
   pthread_exit(0);
 }
 
@@ -6217,9 +6262,6 @@ int main(int argc, char **argv) {
 
     log_debug("shutdown sequence start\n");
 
-    log_debug("Waiting for input_thread...\n");
-    pthread_join(input_thread, NULL);
-
     if (is_recording) {
       rec_thread_needs_write = 1;
       pthread_cond_signal(&rec_cond);
@@ -6239,6 +6281,9 @@ int main(int argc, char **argv) {
       }
       pthread_mutex_unlock(&camera_finish_mutex);
     }
+
+    log_debug("Waiting for input_thread...\n");
+    pthread_join(input_thread, NULL);
   }
 
   stop_openmax_capturing();
