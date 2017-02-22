@@ -60,7 +60,7 @@ extern "C" {
 #include "timestamp.h"
 #include "subtitle.h"
 
-#define PROGRAM_NAME     "picam"
+#define PROGRAM_NAME     "picam-mar"
 #define PROGRAM_VERSION  "1.4.6"
 
 // Audio-only stream is created if this is 1 (for debugging)
@@ -116,11 +116,14 @@ static OMX_U8 *video_encode_input_buf_pBuffer_orig = NULL;
 #define ENABLE_AUTO_GOP_SIZE_CONTROL_FOR_VFR 1
 
 // OpenMAX IL ports
+
 static const int CAMERA_PREVIEW_PORT      = 70;
 static const int CAMERA_CAPTURE_PORT      = 71;
 static const int CAMERA_INPUT_PORT        = 73;
 static const int CLOCK_OUTPUT_1_PORT      = 80;
 static const int VIDEO_RENDER_INPUT_PORT  = 90;
+static const int VIDEO_DECODE_INPUT_PORT  = 130;
+static const int VIDEO_DECODE_OUTPUT_PORT = 131;
 static const int VIDEO_ENCODE_INPUT_PORT  = 200;
 static const int VIDEO_ENCODE_OUTPUT_PORT = 201;
 
@@ -149,6 +152,7 @@ typedef struct EncodedPacket {
 
 static const int log_level_default = LOG_LEVEL_INFO;
 static int video_width;
+static int decbuf_next_frame = 0;
 static const int video_width_default = 1280;
 static int video_width_32;
 static int video_height;
@@ -310,6 +314,8 @@ static const float awb_red_gain_default = 0.0f;
 static float awb_blue_gain;
 static const float awb_blue_gain_default = 0.0f;
 
+static int record_starving = 0;
+
 static char exposure_metering[8];
 static const char *exposure_metering_default = "average";
 typedef struct exposure_metering_option {
@@ -412,6 +418,7 @@ static char timestamp_font_name[128];
 static const char *timestamp_font_name_default = "FreeMono:style=Bold";
 static char i2c_device_path[32];
 static const char *i2c_device_path_default = "/dev/i2c-1";
+static char input_file[64];
 static char timestamp_font_file[1024];
 static int timestamp_font_face_index;
 static const int timestamp_font_face_index_default = 0;
@@ -454,6 +461,7 @@ int is_audio_buffer_filled = 0;
 static int disable_audio_capturing = 0;
 
 static pthread_t audio_nop_thread;
+static pthread_t input_thread;
 
 static int fr_q16;
 
@@ -466,6 +474,8 @@ static void cam_fill_buffer_done_mmal(MMAL_BUFFER_HEADER_T *mbuf);
 static void encode_and_send_audio();
 void start_record();
 void stop_record();
+static void send_audio_start_time();
+static void send_video_start_time();
 #if ENABLE_AUTO_GOP_SIZE_CONTROL_FOR_VFR
 static void set_gop_size(int gop_size);
 #endif
@@ -1047,6 +1057,47 @@ void start_camera_streaming(int fd)
    write_regs(fd, cmds2, NUM_REGS_CMD2);
 }
 
+static OMX_VERSIONTYPE SpecificationVersion = {
+	.s.nVersionMajor = 1,
+	.s.nVersionMinor = 1,
+	.s.nRevision     = 2,
+	.s.nStep         = 0
+};
+
+#define MAKEME(y, x)	do {						\
+				y = calloc(1, sizeof(x));		\
+				y->nSize = sizeof(x);			\
+				y->nVersion = SpecificationVersion;	\
+			} while (0)
+
+
+#define OERR(cmd)	do {						\
+				OMX_ERRORTYPE oerr = cmd;		\
+				if (oerr != OMX_ErrorNone) {		\
+					log_error( \
+						" failed on line %d: %x\n", \
+						__LINE__, oerr);	\
+					exit(1);			\
+				} else {				\
+					log_debug( \
+						" completed at %d.\n",	\
+						__LINE__);		\
+				}					\
+			} while (0)
+
+#define OERRq(cmd)	do {	\
+      OMX_ERRORTYPE oerr = cmd;				\
+				if (oerr != OMX_ErrorNone) {		\
+					log_error(		\
+						" failed: %x\n", oerr);	\
+					exit(1);			\
+				}					\
+			} while (0)
+
+static OMX_HANDLETYPE	hdmi_decoder;
+static OMX_BUFFERHEADERTYPE		*decbufs;
+static OMX_BUFFERHEADERTYPE		*decbufs_out;
+
 static MMAL_COMPONENT_T *hdmi_rawcam, *hdmi_render, *hdmi_isp, *hdmi_splitter;
 static MMAL_STATUS_T hdmi_status;
 static MMAL_PORT_T *hdmi_output, *hdmi_input, *hdmi_isp_input, *hdmi_splitter_output2, *hdmi_isp_output;
@@ -1058,6 +1109,36 @@ static int i2c_fd;
 static int hdmi_running = 0, hdmi_frame_skip = 0;
 static unsigned int hdmi_width, hdmi_height, hdmi_fps, hdmi_frame_interval;
 static unsigned int hdmi_frame_width, hdmi_frame_height, hdmi_expected_frame_bytes;
+
+static OMX_BUFFERHEADERTYPE *allocbufs(OMX_HANDLETYPE h, int port, int enable)
+{
+	int i;
+	OMX_BUFFERHEADERTYPE *list = NULL, **end = &list;
+	OMX_PARAM_PORTDEFINITIONTYPE *portdef;
+
+	MAKEME(portdef, OMX_PARAM_PORTDEFINITIONTYPE);
+	portdef->nPortIndex = port;
+	OERR(OMX_GetParameter(h, OMX_IndexParamPortDefinition, portdef));
+
+	if (enable)
+		OERR(OMX_SendCommand(h, OMX_CommandPortEnable, port, NULL));
+
+	for (i = 0; i < portdef->nBufferCountActual; i++) {
+		OMX_U8 *buf;
+
+		buf = vcos_malloc_aligned(portdef->nBufferSize,
+			portdef->nBufferAlignment, "buffer");
+		printf("Allocated a buffer of %d bytes\n",
+			portdef->nBufferSize);
+		OERR(OMX_UseBuffer(h, end, port, NULL, portdef->nBufferSize,
+			buf));
+		end = (OMX_BUFFERHEADERTYPE **) &((*end)->pAppPrivate);
+	}
+
+	free(portdef);
+
+	return list;
+}
 
 void stop_camera_streaming()
 {
@@ -1158,6 +1239,274 @@ static void hdmi_component_destroy() {
   mmal_component_destroy(hdmi_render);
   mmal_component_destroy(hdmi_splitter);
   close(i2c_fd);
+}
+
+void stopSignalHandler(int signo) {
+  keepRunning = 0;
+  log_debug("stop requested (signal=%d)\n", signo);
+}
+
+OMX_ERRORTYPE emptied(OMX_HANDLETYPE component,
+				struct context *ctx,
+				OMX_BUFFERHEADERTYPE *buf)
+{
+//  log_debug("Emptied\n");
+//	if (ctx->flags & FLAGS_VERBOSE)
+//		printf("Got a buffer emptied event on %s %p, buf %p\n",
+//			mapcomponent(ctx, component), component, buf);
+  buf->nFilledLen = 0;
+  //ctx->flags |= FLAGS_DECEMPTIEDBUF;
+	return OMX_ErrorNone;
+}
+
+OMX_ERRORTYPE filled(OMX_HANDLETYPE component,
+				struct context *ctx,
+				OMX_BUFFERHEADERTYPE *buf)
+{
+	OMX_BUFFERHEADERTYPE *spare;
+
+		log_debug("Got buffer %p filled (len %d)\n", buf,
+			buf->nFilledLen);
+
+/*
+ * Don't call OMX_FillThisBuffer() here, as the hardware craps out after
+ * a short while.  I don't know why.  Reentrancy, or the like, I suspect.
+ * Queue the packet(s) and deal with them in main().
+ *
+ * It only ever seems to ask for the one buffer, but better safe than sorry...
+ */
+
+ if (is_video_recording_started == 0) {
+   is_video_recording_started = 1;
+   if (is_audio_recording_started == 1) {
+     struct timespec ts;
+     clock_gettime(CLOCK_MONOTONIC, &ts);
+     video_start_time = audio_start_time = ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec;
+     send_video_start_time();
+     send_audio_start_time();
+     log_info("capturing started\n");
+   } else {
+     log_debug("waiting for audio...\n");
+   }
+ }
+
+ if (is_audio_recording_started == 1) {
+   if (video_pending_drop_frames > 0) {
+     log_info("dV");
+     video_pending_drop_frames--;
+   } else {
+     log_info(".");
+     timestamp_update();
+     subtitle_update();
+     last_video_buffer = buf;
+   //  int is_text_changed = text_draw_all(last_video_buffer, video_width_32, video_height_16, 1); // is_video = 1
+     encode_and_send_image(NULL);
+     log_info("!");
+   }
+ }
+ decbuf_next_frame = 1;
+ buf->nFilledLen = 0;
+ buf->nOffset = 0;
+/*
+	pthread_mutex_lock(&spare_lock);
+	if (ctx->bufhead == NULL) {
+		buf->pAppPrivate = NULL;
+		ctx->bufhead = buf;
+		pthread_mutex_unlock(&spare_lock);
+		return OMX_ErrorNone;
+	}
+
+	spare = ctx->bufhead;
+	while (spare->pAppPrivate != NULL)
+		spare = spare->pAppPrivate;
+
+	spare->pAppPrivate = buf;
+	buf->pAppPrivate = NULL;
+	pthread_mutex_unlock(&spare_lock);*/
+
+	return OMX_ErrorNone;
+}
+
+/* Print some useful information about the state of the port: */
+static void dumpport(OMX_HANDLETYPE handle, int port)
+{
+	OMX_VIDEO_PORTDEFINITIONTYPE	*viddef;
+	OMX_PARAM_PORTDEFINITIONTYPE	*portdef;
+
+	MAKEME(portdef, OMX_PARAM_PORTDEFINITIONTYPE);
+	portdef->nPortIndex = port;
+	OERR(OMX_GetParameter(handle, OMX_IndexParamPortDefinition, portdef));
+
+	printf("Port %d is %s, %s\n", portdef->nPortIndex,
+		(portdef->eDir == 0 ? "input" : "output"),
+		(portdef->bEnabled == 0 ? "disabled" : "enabled"));
+	printf("Wants %d bufs, needs %d, size %d, enabled: %d, pop: %d, "
+		"aligned %d\n", portdef->nBufferCountActual,
+		portdef->nBufferCountMin, portdef->nBufferSize,
+		portdef->bEnabled, portdef->bPopulated,
+		portdef->nBufferAlignment);
+	viddef = &portdef->format.video;
+
+	switch (portdef->eDomain) {
+	case OMX_PortDomainVideo:
+		printf("Video type is currently:\n"
+			"\tMIME:\t\t%s\n"
+			"\tNative:\t\t%p\n"
+			"\tWidth:\t\t%d\n"
+			"\tHeight:\t\t%d\n"
+			"\tStride:\t\t%d\n"
+			"\tSliceHeight:\t%d\n"
+			"\tBitrate:\t%d\n"
+			"\tFramerate:\t%d (%x); (%f)\n"
+			"\tError hiding:\t%d\n"
+			"\tCodec:\t\t%d\n"
+			"\tColour:\t\t%d\n",
+			viddef->cMIMEType, viddef->pNativeRender,
+			viddef->nFrameWidth, viddef->nFrameHeight,
+			viddef->nStride, viddef->nSliceHeight,
+			viddef->nBitrate,
+			viddef->xFramerate, viddef->xFramerate,
+			((float)viddef->xFramerate/(float)65536),
+			viddef->bFlagErrorConcealment,
+			viddef->eCompressionFormat, viddef->eColorFormat);
+		break;
+	case OMX_PortDomainImage:
+		printf("Image type is currently:\n"
+			"\tMIME:\t\t%s\n"
+			"\tNative:\t\t%p\n"
+			"\tWidth:\t\t%d\n"
+			"\tHeight:\t\t%d\n"
+			"\tStride:\t\t%d\n"
+			"\tSliceHeight:\t%d\n"
+			"\tError hiding:\t%d\n"
+			"\tCodec:\t\t%d\n"
+			"\tColour:\t\t%d\n",
+			portdef->format.image.cMIMEType,
+			portdef->format.image.pNativeRender,
+			portdef->format.image.nFrameWidth,
+			portdef->format.image.nFrameHeight,
+			portdef->format.image.nStride,
+			portdef->format.image.nSliceHeight,
+			portdef->format.image.bFlagErrorConcealment,
+			portdef->format.image.eCompressionFormat,
+			portdef->format.image.eColorFormat);
+		break;
+/* Feel free to add others. */
+	default:
+		break;
+	}
+
+	free(portdef);
+}
+
+OMX_ERRORTYPE deceventhandler(OMX_HANDLETYPE component,
+				struct context *ctx,
+				OMX_EVENTTYPE event,
+				OMX_U32 data1,
+				OMX_U32 data2,
+				OMX_PTR eventdata)
+{
+  switch (event) {
+  	case OMX_EventError:
+      log_error("ERROR");
+  		return data1;
+  		break;
+  	case OMX_EventCmdComplete:
+  		log_debug("Command complete\n");
+  		break;
+  	case OMX_EventPortSettingsChanged: {
+  		log_debug("Port changed\n");
+  		dumpport(component, data1);
+      OERR(OMX_FillThisBuffer(hdmi_decoder, decbufs_out));
+  	}
+  		break;
+  	default:
+  			printf("Got an event of type %x "
+  				"(d1: %x, d2 %x)\n", event,
+  				data1, data2);
+  	}
+
+  	return OMX_ErrorNone;
+}
+
+OMX_CALLBACKTYPE decevents = {
+	(void (*)) deceventhandler,
+	(void (*)) emptied,
+	(void (*)) filled
+};
+
+
+
+static int setup_usb_hdmi_input() {
+	OMX_PARAM_PORTDEFINITIONTYPE	*portdef;
+  OMX_PORT_PARAM_TYPE		*porttype;
+	OMX_VIDEO_PORTDEFINITIONTYPE	*viddef;
+	OMX_PARAM_PORTDEFINITIONTYPE	*imgportdef;
+	OMX_VIDEO_PARAM_PORTFORMATTYPE	*pfmt;
+	OMX_CONFIG_POINTTYPE		*pixaspect;
+  OMX_PARAM_U32TYPE		*extra_buffers;
+	OMX_CONFIG_IMAGEFILTERPARAMSTYPE *image_filter;
+
+  // We set all these things right away as they are completely fixed
+  video_fps = 30;
+  hdmi_fps = 30;
+  video_width = 1280;
+  video_height = 720;
+  hdmi_width = 1280;
+  hdmi_height = 720;
+
+
+    // YUV420 12bits per pixel
+    hdmi_expected_frame_bytes = hdmi_width * hdmi_height * 1.5;
+
+    log_debug("Seting up for USB HDMI %dx%d @ %f fps\n", video_width,
+                                            video_height, video_fps);
+
+	MAKEME(portdef, OMX_PARAM_PORTDEFINITIONTYPE);
+	MAKEME(imgportdef, OMX_PARAM_PORTDEFINITIONTYPE);
+	MAKEME(pixaspect, OMX_CONFIG_POINTTYPE);
+	MAKEME(extra_buffers, OMX_PARAM_U32TYPE);
+	MAKEME(image_filter, OMX_CONFIG_IMAGEFILTERPARAMSTYPE);
+  MAKEME(porttype, OMX_PORT_PARAM_TYPE);
+  MAKEME(pfmt, OMX_VIDEO_PARAM_PORTFORMATTYPE);
+  OERR(OMX_GetHandle(&hdmi_decoder, "OMX.broadcom.video_decode", NULL, &decevents));
+
+  OERR(OMX_GetParameter(hdmi_decoder, OMX_IndexParamVideoInit, porttype));
+	printf("Found %d ports, starting at %d (%x) on decoder\n",
+		porttype->nPorts, porttype->nStartPortNumber,
+		porttype->nStartPortNumber);
+
+  OERR(OMX_SendCommand(hdmi_decoder, OMX_CommandPortDisable, VIDEO_DECODE_INPUT_PORT, NULL));
+	OERR(OMX_SendCommand(hdmi_decoder, OMX_CommandPortDisable, VIDEO_DECODE_OUTPUT_PORT, NULL));
+
+  // Get decoder input params
+  portdef->nPortIndex = VIDEO_DECODE_INPUT_PORT;
+  OERR(OMX_GetParameter(hdmi_decoder, OMX_IndexParamPortDefinition, portdef));
+
+  // Set decoder input params
+  viddef = &portdef->format.video;
+  viddef->nFrameWidth = hdmi_width;
+  viddef->nFrameHeight = hdmi_height;
+  viddef->eCompressionFormat = OMX_VIDEO_CodingMJPEG;
+  viddef->bFlagErrorConcealment = 0;
+  OERR(OMX_SetParameter(hdmi_decoder, OMX_IndexParamPortDefinition, portdef));
+
+  /* Dump current port states: */
+	dumpport(hdmi_decoder, VIDEO_DECODE_INPUT_PORT);
+	dumpport(hdmi_decoder, VIDEO_DECODE_OUTPUT_PORT);
+
+  OERR(OMX_SendCommand(hdmi_decoder, OMX_CommandStateSet, OMX_StateIdle, NULL));
+
+  decbufs = allocbufs(hdmi_decoder, VIDEO_DECODE_INPUT_PORT, 1);
+  decbufs_out = allocbufs(hdmi_decoder, VIDEO_DECODE_OUTPUT_PORT, 1);
+  //OMX_AllocateBuffer(ctx.encoder, &ctx.encoder_ppBuffer_in, 130, NULL, encoder_portdef.nBufferSize))
+
+  OERR(OMX_SendCommand(hdmi_decoder, OMX_CommandStateSet, OMX_StateExecuting, NULL));
+
+
+  //OERR(OMX_SendCommand(hdmi_decoder, OMX_CommandPortEnable, VIDEO_DECODE_OUTPUT_PORT, NULL));
+
+  return 0;
 }
 
 static int setup_hdmi_input() {
@@ -1306,11 +1655,17 @@ static int setup_hdmi_input() {
   log_debug("Waiting to detect signal...\n");
 
   int count=0;
-  while((count<20) && (no_sync(i2c_fd) || no_signal(i2c_fd)))
+  while((count<2000) && (no_sync(i2c_fd) || no_signal(i2c_fd)))
   {
-     vcos_sleep(200);
+     vcos_sleep(300);
      count++;
   }
+
+  if(count == 2000) {
+    log_fatal("No HDMI signal found\n");
+    exit(EXIT_FAILURE);
+  }
+
   log_debug("Signal reported\n");
   hdmi_width = ((i2c_rd8(i2c_fd, DE_WIDTH_H_HI) & 0x1f) << 8) +
      i2c_rd8(i2c_fd, DE_WIDTH_H_LO);
@@ -1328,6 +1683,7 @@ static int setup_hdmi_input() {
   hdmi_fps =  (hdmi_frame_interval > 0) ?
             (10000/hdmi_frame_interval) : 0;
   hdmi_expected_frame_bytes = hdmi_width * hdmi_height * 1.5;
+
   log_info("Signal is %u x %u, frm_interval %u, so %u fps, %u bytes per frame\n",
           hdmi_width, hdmi_height, hdmi_frame_interval, hdmi_fps,
           hdmi_expected_frame_bytes);
@@ -1597,6 +1953,9 @@ static void add_encoded_packet(int64_t pts, uint8_t *data, int size, int stream_
       next_keyframe_pointer = 0;
     }
     if (current_encoded_packet == keyframe_pointers[next_keyframe_pointer]) {
+      if(record_starving++ >= 2) {
+        stopSignalHandler(1);
+      }
       log_warn("warning: Record buffer is starving. Recorded file may not start from keyframe. Try reducing the value of --gopsize.\n");
     }
 
@@ -3703,11 +4062,6 @@ static int timespec_subtract(struct timespec *result, struct timespec *t2, struc
   return (diff<0);
 }
 
-void stopSignalHandler(int signo) {
-  keepRunning = 0;
-  log_debug("stop requested (signal=%d)\n", signo);
-}
-
 static void shutdown_video() {
   int i;
 
@@ -3991,7 +4345,7 @@ static void cam_fill_buffer_done_mmal(MMAL_BUFFER_HEADER_T *mbuf) {
     }
 #endif
 
-    stop_camera_streaming();
+
 
     // Notify the main thread that the camera is stopped
     pthread_mutex_lock(&camera_finish_mutex);
@@ -5099,6 +5453,8 @@ static void encode_and_send_image(MMAL_BUFFER_HEADER_T *mbuf) {
     log_error("error emptying buffer: 0x%x\n", error);
   }
 
+  log_debug("sending buffer emptied\n");
+
   out = ilclient_get_output_buffer(video_encode, VIDEO_ENCODE_OUTPUT_PORT, 1);
 
   while (1) {
@@ -5106,6 +5462,8 @@ static void encode_and_send_image(MMAL_BUFFER_HEADER_T *mbuf) {
     if (error != OMX_ErrorNone) {
       log_error("error filling video_encode buffer: 0x%x\n", error);
     }
+
+    log_debug("waiting for final encoded frame\n");
 
     if (out->nFilledLen > 0) {
       video_encode_fill_buffer_done(out);
@@ -5472,6 +5830,78 @@ static void openmax_cam_loop() {
   }
 }
 
+static void *input_loop() {
+  struct timespec ts;
+  int ret, k, size, nsize, offset, i;
+  OMX_BUFFERHEADERTYPE *spare;
+  unsigned char test_jpeg[200000];
+
+  FILE *testFile;
+  testFile = fopen(input_file, "rb");
+  if (testFile)
+  {
+      fseek(testFile, 0, SEEK_END);
+	    size=ftell(testFile);
+	    fseek(testFile, 0, SEEK_SET);
+      fread(test_jpeg, size, 1, testFile);
+      printf("Read %d bytes from %s into jpeg buffer\n", size, input_file);
+      fclose(testFile);
+  }
+  offset = 0;
+  i = 0;
+
+  log_info("Input loop started for file: %s\n", input_file);
+
+  while (keepRunning) {
+
+    if(hdmi_running) {
+
+      spare = decbufs;
+
+      for (k = 0; spare && spare->nFilledLen != 0; k++) {
+			   spare = spare->pAppPrivate;
+       }
+
+       if(spare) {
+        if (size - offset > spare->nAllocLen) {
+    			nsize = spare->nAllocLen;
+    		} else {
+    			nsize = size - offset;
+    		}
+
+        memcpy(spare->pBuffer, &test_jpeg[offset], nsize);
+    		spare->nFlags = i++ == 0 ? OMX_BUFFERFLAG_STARTTIME : 0;
+    		spare->nFlags |= (size - offset) == nsize ? OMX_BUFFERFLAG_ENDOFFRAME : 0;
+
+        spare->nFlags |= OMX_BUFFERFLAG_SYNCFRAME;
+    		//spare->nTimeStamp = tick;
+    		spare->nFilledLen = nsize;
+    		spare->nOffset = 0;
+    		OERRq(OMX_EmptyThisBuffer(hdmi_decoder, spare));
+        if(offset + nsize < size) {
+          offset += nsize;
+        } else {
+          offset = 0;
+        }
+        log_debug("Wrote %d bytes, offset is now %d\n", nsize, offset);
+        if(i > 6 && offset == 0 && decbuf_next_frame) {
+          decbuf_next_frame = 0;
+          decbufs_out->nFilledLen = 0;
+          decbufs_out->nOffset = 0;
+          OERRq(OMX_FillThisBuffer(hdmi_decoder, decbufs_out));
+        }
+        vcos_sleep(20);
+      } else {
+        log_debug("No buffers left\n");
+        vcos_sleep(100);
+      }
+
+    }
+
+  }
+  pthread_exit(0);
+}
+
 static void *audio_nop_loop() {
   struct timespec ts;
   int ret;
@@ -5829,6 +6259,7 @@ int main(int argc, char **argv) {
     { "timepos", required_argument, NULL, 0 },
     { "timealign", required_argument, NULL, 0 },
     { "i2cdev", required_argument, NULL, 0 },
+    { "input", required_argument, NULL, 0 },
     { "timefontname", required_argument, NULL, 0 },
     { "timefontfile", required_argument, NULL, 0 },
     { "timefontface", required_argument, NULL, 0 },
@@ -5950,6 +6381,7 @@ int main(int argc, char **argv) {
   strncpy(timestamp_font_name, timestamp_font_name_default, sizeof(timestamp_font_name) - 1);
   strncpy(i2c_device_path, i2c_device_path_default, sizeof(timestamp_font_name) - 1);
   timestamp_font_name[sizeof(timestamp_font_name) - 1] = '\0';
+  input_file[0] = '\0';
   i2c_device_path[sizeof(i2c_device_path)-1] = '\0';
   timestamp_font_face_index = timestamp_font_face_index_default;
   timestamp_font_points = timestamp_font_points_default;
@@ -6387,6 +6819,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(long_options[option_index].name, "i2cdev") == 0) {
           strncpy(i2c_device_path, optarg, sizeof(i2c_device_path) - 1);
           i2c_device_path[sizeof(i2c_device_path) - 1] = '\0';
+        } else if (strcmp(long_options[option_index].name, "input") == 0) {
+          strncpy(input_file, optarg, sizeof(input_file) - 1);
+          input_file[sizeof(input_file) - 1] = '\0';
         } else if (strcmp(long_options[option_index].name, "timefontfile") == 0) {
           strncpy(timestamp_font_file, optarg, sizeof(timestamp_font_file) - 1);
           timestamp_font_file[sizeof(timestamp_font_file) - 1] = '\0';
@@ -6923,17 +7358,23 @@ int main(int argc, char **argv) {
 
   bcm_host_init();
 
-  if(is_hdmi_enabled) {
-    log_info("HDMI Enabled, starting..\n");
-    setup_hdmi_input();
-  }
-
   ret = OMX_Init();
   if (ret != OMX_ErrorNone) {
     log_fatal("error: OMX_Init failed: 0x%x\n", ret);
     ilclient_destroy(ilclient);
     return 1;
   }
+
+  if(is_hdmi_enabled) {
+    log_info("HDMI Enabled, starting..\n");
+    if(input_file[0]) {
+      setup_usb_hdmi_input();
+    } else {
+      setup_hdmi_input();
+    }
+  }
+
+
   memset(component_list, 0, sizeof(component_list));
 
   if (!is_hdmi_enabled && is_preview_enabled) {
@@ -7094,6 +7535,10 @@ int main(int argc, char **argv) {
     log_debug("Entering cam_loop()\n");
     openmax_cam_loop();
 
+    if(input_file[0] != '\0') {
+      pthread_create(&input_thread, NULL, input_loop, NULL);
+    }
+
     if (disable_audio_capturing) {
       pthread_create(&audio_nop_thread, NULL, audio_nop_loop, NULL);
       pthread_join(audio_nop_thread, NULL);
@@ -7103,6 +7548,8 @@ int main(int argc, char **argv) {
     }
 
     log_debug("shutdown sequence start\n");
+    pthread_join(input_thread, NULL);
+
 
     if (is_recording) {
       rec_thread_needs_write = 1;
@@ -7112,19 +7559,23 @@ int main(int argc, char **argv) {
       pthread_join(rec_thread, NULL);
     }
 
-    pthread_mutex_lock(&camera_finish_mutex);
-    // Wait for the camera to finish
-    while (!is_camera_finished) {
-      log_debug("waiting for the camera to finish\n");
-      pthread_cond_wait(&camera_finish_cond, &camera_finish_mutex);
+    if(is_hdmi_enabled) {
+      vcos_sleep(2000);
+    } else {
+      pthread_mutex_lock(&camera_finish_mutex);
+      // Wait for the camera to finish
+      while (!is_camera_finished) {
+        log_debug("waiting for the camera to finish\n");
+        pthread_cond_wait(&camera_finish_cond, &camera_finish_mutex);
+      }
+      pthread_mutex_unlock(&camera_finish_mutex);
     }
-    pthread_mutex_unlock(&camera_finish_mutex);
   }
-
 
   hdmi_connection_disable();
   hdmi_component_disable();
   hdmi_component_destroy();
+  stop_camera_streaming();
 
   stop_openmax_capturing();
   if (is_preview_enabled) {
