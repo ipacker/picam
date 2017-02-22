@@ -47,7 +47,7 @@ extern "C" {
 #include "timestamp.h"
 #include "subtitle.h"
 
-#define PROGRAM_NAME     "picam"
+#define PROGRAM_NAME     "picam-mar"
 #define PROGRAM_VERSION  "1.4.6"
 
 // Audio-only stream is created if this is 1 (for debugging)
@@ -108,6 +108,8 @@ static const int CAMERA_CAPTURE_PORT      = 71;
 static const int CAMERA_INPUT_PORT        = 73;
 static const int CLOCK_OUTPUT_1_PORT      = 80;
 static const int VIDEO_RENDER_INPUT_PORT  = 90;
+static const int VIDEO_DECODE_INPUT_PORT  = 130;
+static const int VIDEO_DECODE_OUTPUT_PORT = 131;
 static const int VIDEO_ENCODE_INPUT_PORT  = 200;
 static const int VIDEO_ENCODE_OUTPUT_PORT = 201;
 
@@ -117,7 +119,8 @@ static char *rec_tmp_dir = "rec/tmp";
 static char *rec_archive_dir = "rec/archive";
 
 // Whether or not to enable clock OMX component
-static const int is_clock_enabled = 1;
+static int is_clock_enabled = 1;
+static int input_capture = 0;
 
 // Pace of PTS
 typedef enum {
@@ -361,6 +364,8 @@ static const int preview_opacity_default = 255;
 static int record_buffer_keyframes;
 static const int record_buffer_keyframes_default = 5;
 
+static char input_path[128];
+
 static int is_timestamp_enabled = 0;
 static char timestamp_format[128];
 static const char *timestamp_format_default = "%a %b %d %l:%M:%S %p";
@@ -419,6 +424,8 @@ int is_audio_buffer_filled = 0;
 static int disable_audio_capturing = 0;
 
 static pthread_t audio_nop_thread;
+static pthread_t input_thread;
+
 
 static int fr_q16;
 
@@ -453,6 +460,7 @@ static int n_component_list = 0;
 static ILCLIENT_T *ilclient;
 
 static ILCLIENT_T *cam_client;
+static COMPONENT_T *video_decode = NULL;
 static COMPONENT_T *camera_component = NULL;
 static COMPONENT_T *render_component = NULL;
 static COMPONENT_T *clock_component = NULL;
@@ -2767,6 +2775,7 @@ static int timespec_subtract(struct timespec *result, struct timespec *t2, struc
 
 void stopSignalHandler(int signo) {
   keepRunning = 0;
+  input_capture = 0;
   log_debug("stop requested (signal=%d)\n", signo);
 }
 
@@ -2792,8 +2801,14 @@ static void shutdown_openmax() {
   }
 
   // Disable port buffers
-  log_debug("shutdown_openmax: disable port buffer for camera %d\n", CAMERA_CAPTURE_PORT);
-  ilclient_disable_port_buffers(camera_component, CAMERA_CAPTURE_PORT, NULL, NULL, NULL);
+  if(input_path[0]) {
+    log_debug("shutdown_openmax: disable port buffer for camera %d\n", VIDEO_ENCODE_INPUT_PORT);
+    ilclient_disable_port_buffers(video_decode, VIDEO_ENCODE_INPUT_PORT, NULL, NULL, NULL);
+    ilclient_disable_port_buffers(video_decode, VIDEO_ENCODE_OUTPUT_PORT, NULL, NULL, NULL);
+  } else {
+    log_debug("shutdown_openmax: disable port buffer for camera %d\n", CAMERA_CAPTURE_PORT);
+    ilclient_disable_port_buffers(camera_component, CAMERA_CAPTURE_PORT, NULL, NULL, NULL);
+  }
   log_debug("shutdown_openmax: disable port buffer for video_encode %d\n", VIDEO_ENCODE_INPUT_PORT);
   ilclient_disable_port_buffers(video_encode, VIDEO_ENCODE_INPUT_PORT, NULL, NULL, NULL);
   log_debug("shutdown_openmax: disable port buffer for video_encode %d\n", VIDEO_ENCODE_OUTPUT_PORT);
@@ -3010,7 +3025,11 @@ static void cam_fill_buffer_done(void *data, COMPONENT_T *comp) {
   OMX_BUFFERHEADERTYPE *out;
   OMX_ERRORTYPE error;
 
-  out = ilclient_get_output_buffer(camera_component, CAMERA_CAPTURE_PORT, 1);
+  if(input_path[0]) {
+    out = ilclient_get_output_buffer(comp, VIDEO_DECODE_OUTPUT_PORT, 1);
+  } else {
+    out = ilclient_get_output_buffer(comp, CAMERA_CAPTURE_PORT, 1);
+  }
   if (out != NULL) {
     if (out->nFilledLen > 0) {
       last_video_buffer = out->pBuffer;
@@ -3056,13 +3075,13 @@ static void cam_fill_buffer_done(void *data, COMPONENT_T *comp) {
   }
 
   if (keepRunning) {
-    error = OMX_FillThisBuffer(ILC_GET_HANDLE(camera_component), out);
+    error = OMX_FillThisBuffer(ILC_GET_HANDLE(comp), out);
     if (error != OMX_ErrorNone) {
       log_error("error filling camera buffer (2): 0x%x\n", error);
     }
   } else {
     // Return the buffer (without this, ilclient_disable_port_buffers will hang)
-    error = OMX_FillThisBuffer(ILC_GET_HANDLE(camera_component), out);
+    error = OMX_FillThisBuffer(ILC_GET_HANDLE(comp), out);
     if (error != OMX_ErrorNone) {
       log_error("error filling camera buffer (3): 0x%x\n", error);
     }
@@ -3304,6 +3323,60 @@ static int openmax_cam_open() {
   }
 
   ilclient_set_fill_buffer_done_callback(cam_client, cam_fill_buffer_done, 0);
+
+  if(input_path[0]) {
+    is_clock_enabled = 0;
+    log_debug("Using input from: %s\n", input_path);
+    video_width = 1280;
+    video_height = 720;
+    video_fps = 30;
+
+    error = ilclient_create_component(cam_client, &video_decode, "video_decode",
+        ILCLIENT_DISABLE_ALL_PORTS |
+        ILCLIENT_ENABLE_OUTPUT_BUFFERS |
+        ILCLIENT_ENABLE_INPUT_BUFFERS);
+    if (error != 0) {
+      log_fatal("error: failed to create video_decode component: 0x%x\n", error);
+      exit(EXIT_FAILURE);
+    }
+    component_list[n_component_list++] = video_decode;
+
+    // Get input port def
+    memset(&cam_def, 0, sizeof(OMX_PARAM_PORTDEFINITIONTYPE));
+    cam_def.nSize = sizeof(OMX_PARAM_PORTDEFINITIONTYPE);
+    cam_def.nVersion.nVersion = OMX_VERSION;
+    cam_def.nPortIndex = VIDEO_DECODE_INPUT_PORT;
+
+    error = OMX_GetParameter(ILC_GET_HANDLE(video_decode),
+        OMX_IndexParamPortDefinition, &cam_def);
+    if (error != OMX_ErrorNone) {
+      log_fatal("error: failed to get video_decode %d port definition: 0x%x\n",
+                      VIDEO_DECODE_INPUT_PORT, error);
+      exit(EXIT_FAILURE);
+    }
+
+    cam_def.format.video.nFrameWidth = video_width;
+    cam_def.format.video.nFrameHeight = video_height;
+    cam_def.format.video.eCompressionFormat = OMX_VIDEO_CodingMJPEG;
+    cam_def.format.video.bFlagErrorConcealment = 0;
+
+    // Set input port def
+    error = OMX_SetParameter(ILC_GET_HANDLE(video_decode),
+        OMX_IndexParamPortDefinition, &cam_def);
+    if (error != OMX_ErrorNone) {
+      log_fatal("error: failed to set video_decode %d port definition: 0x%x\n",
+                      VIDEO_DECODE_INPUT_PORT, error);
+      exit(EXIT_FAILURE);
+    }
+
+    log_debug("Setting video_decode to idle\n");
+    if (ilclient_change_component_state(video_decode, OMX_StateIdle) == -1) {
+      log_fatal("error: failed to set video_decode to idle state\n");
+      exit(EXIT_FAILURE);
+    }
+
+    return 0;
+  }
 
   // create camera_component
   error = ilclient_create_component(cam_client, &camera_component, "camera",
@@ -4002,11 +4075,23 @@ static int video_encode_startup() {
     exit(EXIT_FAILURE);
   }
 
-  // Enable port buffers for port 71 (camera capture output)
-  log_debug("Enable port buffers for camera %d\n", CAMERA_CAPTURE_PORT);
-  if (ilclient_enable_port_buffers(camera_component, CAMERA_CAPTURE_PORT, NULL, NULL, NULL) != 0) {
-    log_fatal("error: failed to enable port buffers for camera %d\n", CAMERA_CAPTURE_PORT);
-    exit(EXIT_FAILURE);
+  if(input_path[0]) {
+    log_debug("Enable port buffers for video_decode %d\n", VIDEO_DECODE_OUTPUT_PORT);
+    if (ilclient_enable_port_buffers(video_decode, VIDEO_DECODE_OUTPUT_PORT, NULL, NULL, NULL) != 0) {
+      log_fatal("error: failed to enable port buffers for camera %d\n", VIDEO_DECODE_OUTPUT_PORT);
+      exit(EXIT_FAILURE);
+    }
+    if (ilclient_enable_port_buffers(video_decode, VIDEO_DECODE_INPUT_PORT, NULL, NULL, NULL) != 0) {
+      log_fatal("error: failed to enable port buffers for camera %d\n", VIDEO_DECODE_INPUT_PORT);
+      exit(EXIT_FAILURE);
+    }
+  } else {
+    // Enable port buffers for port 71 (camera capture output)
+    log_debug("Enable port buffers for camera %d\n", CAMERA_CAPTURE_PORT);
+    if (ilclient_enable_port_buffers(camera_component, CAMERA_CAPTURE_PORT, NULL, NULL, NULL) != 0) {
+      log_fatal("error: failed to enable port buffers for camera %d\n", CAMERA_CAPTURE_PORT);
+      exit(EXIT_FAILURE);
+    }
   }
 
   // Enable port buffers for port 200 (video_encode input)
@@ -4023,9 +4108,15 @@ static int video_encode_startup() {
     exit(EXIT_FAILURE);
   }
 
-  log_debug("Set camera state to executing\n");
-  // Set camera component to executing state
-  ilclient_change_component_state(camera_component, OMX_StateExecuting);
+  if(input_path[0]) {
+    log_debug("Set video_decode state to executing...");
+    ilclient_change_component_state(video_decode, OMX_StateExecuting);
+    log_debug("Done\n");
+  } else {
+    log_debug("Set camera state to executing\n");
+    // Set camera component to executing state
+    ilclient_change_component_state(camera_component, OMX_StateExecuting);
+  }
 
   log_debug("Set video_encode state to executing\n");
   // Set video_encode component to executing state
@@ -4370,12 +4461,16 @@ static void start_openmax_capturing() {
   boolean.nPortIndex = CAMERA_CAPTURE_PORT;
   boolean.bEnabled = OMX_TRUE;
 
-  log_debug("start capturing video\n");
-  error = OMX_SetParameter(ILC_GET_HANDLE(camera_component),
-      OMX_IndexConfigPortCapturing, &boolean);
-  if (error != OMX_ErrorNone) {
-    log_fatal("error: failed to start capturing video: 0x%x\n", error);
-    exit(EXIT_FAILURE);
+  if(!input_path[0]) {
+    log_debug("start capturing video\n");
+    error = OMX_SetParameter(ILC_GET_HANDLE(camera_component),
+        OMX_IndexConfigPortCapturing, &boolean);
+    if (error != OMX_ErrorNone) {
+      log_fatal("error: failed to start capturing video: 0x%x\n", error);
+      exit(EXIT_FAILURE);
+    }
+  } else {
+    input_capture = 1;
   }
 
   if (is_clock_enabled) {
@@ -4396,18 +4491,20 @@ static void stop_openmax_capturing() {
     stop_openmax_clock();
   }
 
-  memset(&boolean, 0, sizeof(OMX_CONFIG_PORTBOOLEANTYPE));
-  boolean.nSize = sizeof(OMX_CONFIG_PORTBOOLEANTYPE);
-  boolean.nVersion.nVersion = OMX_VERSION;
-  boolean.nPortIndex = CAMERA_CAPTURE_PORT;
-  boolean.bEnabled = OMX_FALSE;
+  if(!input_path[0]) {
+    memset(&boolean, 0, sizeof(OMX_CONFIG_PORTBOOLEANTYPE));
+    boolean.nSize = sizeof(OMX_CONFIG_PORTBOOLEANTYPE);
+    boolean.nVersion.nVersion = OMX_VERSION;
+    boolean.nPortIndex = CAMERA_CAPTURE_PORT;
+    boolean.bEnabled = OMX_FALSE;
 
-  log_debug("stop capturing video\n");
-  error = OMX_SetParameter(ILC_GET_HANDLE(camera_component),
-      OMX_IndexConfigPortCapturing, &boolean);
-  if (error != OMX_ErrorNone) {
-    log_fatal("error: failed to stop capturing video: 0x%x\n", error);
-    exit(EXIT_FAILURE);
+    log_debug("stop capturing video\n");
+    error = OMX_SetParameter(ILC_GET_HANDLE(camera_component),
+        OMX_IndexConfigPortCapturing, &boolean);
+    if (error != OMX_ErrorNone) {
+      log_fatal("error: failed to stop capturing video: 0x%x\n", error);
+      exit(EXIT_FAILURE);
+    }
   }
 }
 
@@ -4418,21 +4515,88 @@ static void openmax_cam_loop() {
   start_openmax_capturing();
 
   log_debug("waiting for the first video buffer\n");
-  out = ilclient_get_output_buffer(camera_component, CAMERA_CAPTURE_PORT, 1);
+  if(input_path[0]) {
+    out = ilclient_get_output_buffer(video_decode, VIDEO_DECODE_OUTPUT_PORT, 1);
 
-  error = OMX_FillThisBuffer(ILC_GET_HANDLE(camera_component), out);
-  if (error != OMX_ErrorNone) {
-    log_error("error filling camera buffer (1): 0x%x\n", error);
+    error = OMX_FillThisBuffer(ILC_GET_HANDLE(video_decode), out);
+    if (error != OMX_ErrorNone) {
+      log_error("error filling video decode output buffer (1): 0x%x\n", error);
+    }
+  } else {
+    out = ilclient_get_output_buffer(camera_component, CAMERA_CAPTURE_PORT, 1);
+
+    error = OMX_FillThisBuffer(ILC_GET_HANDLE(camera_component), out);
+    if (error != OMX_ErrorNone) {
+      log_error("error filling camera buffer (1): 0x%x\n", error);
+    }
+
+    // Changing the white balance only take effect after this point.
+    if (camera_set_white_balance(white_balance) != 0) {
+      exit(EXIT_FAILURE);
+    }
+
+    if (camera_set_custom_awb_gains() != 0) {
+      exit(EXIT_FAILURE);
+    }
   }
+}
 
-  // Changing the white balance only take effect after this point.
-  if (camera_set_white_balance(white_balance) != 0) {
+static void *input_thread_loop() {
+  struct timespec ts;
+  int ret, k, size, nsize, offset, i;
+  OMX_BUFFERHEADERTYPE *buf;
+  OMX_ERRORTYPE error;
+  unsigned char test_jpeg[200000];
+  FILE *testFile;
+
+  testFile = fopen(input_path, "rb");
+  if (testFile)
+  {
+    fseek(testFile, 0, SEEK_END);
+    size = ftell(testFile);
+    fseek(testFile, 0, SEEK_SET);
+    fread(test_jpeg, size, 1, testFile);
+    log_debug("Read %d bytes from %s into jpeg buffer\n", size, input_path);
+    fclose(testFile);
+  } else {
     exit(EXIT_FAILURE);
   }
+  offset = 0;
+  i = 0;
 
-  if (camera_set_custom_awb_gains() != 0) {
-    exit(EXIT_FAILURE);
+  log_debug("input_loop() forked, using: %s\n", input_path);
+
+  while (keepRunning) {
+    if (input_capture) {
+      buf = ilclient_get_input_buffer(video_decode, VIDEO_DECODE_INPUT_PORT, 1);
+      if (buf == NULL) {
+        log_error("error: cannot get input buffer from video_decode\n");
+        exit(EXIT_FAILURE);
+      }
+
+      //printf("Buffer (jpeg input) size = %d\n", buf->nAllocLen);
+
+      memcpy(buf->pBuffer, test_jpeg, size);
+      buf->nFilledLen = size;
+
+      buf->nFlags = i++ == 0 ? OMX_BUFFERFLAG_STARTTIME : 0;
+			buf->nFlags |= OMX_BUFFERFLAG_ENDOFFRAME;
+
+      // OMX_EmptyThisBuffer takes 22000-27000 usec at 1920x1080
+      error = OMX_EmptyThisBuffer(ILC_GET_HANDLE(video_decode), buf);
+      if (error != OMX_ErrorNone) {
+        log_error("error emptying buffer: 0x%x\n", error);
+      }
+      // sleep 100ms
+      ts.tv_sec = 0;
+      ts.tv_nsec = 35000000;
+      ret = clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
+      if (ret != 0) {
+        log_error("nanosleep error:%d\n", ret);
+      }
+    }
   }
+  pthread_exit(0);
 }
 
 static void *audio_nop_loop() {
@@ -4733,6 +4897,7 @@ static void print_usage() {
   log_info("  --statedir <dir>    Set state dir (default: %s)\n", state_dir_default);
   log_info("  --hooksdir <dir>    Set hooks dir (default: %s)\n", hooks_dir_default);
   log_info("  -q, --quiet         Suppress all output except errors\n");
+  log_info("  --input <pipe>      Take MJPEG or H264 video input from a pipe\n");
   log_info("  --verbose           Enable verbose output\n");
   log_info("  --version           Print program version\n");
   log_info("  --help              Print this help\n");
@@ -4793,6 +4958,7 @@ int main(int argc, char **argv) {
     { "timealign", required_argument, NULL, 0 },
     { "timefontname", required_argument, NULL, 0 },
     { "timefontfile", required_argument, NULL, 0 },
+    { "input", required_argument, NULL, 0 },
     { "timefontface", required_argument, NULL, 0 },
     { "timept", required_argument, NULL, 0 },
     { "timedpi", required_argument, NULL, 0 },
@@ -4916,6 +5082,8 @@ int main(int argc, char **argv) {
   timestamp_stroke_color = timestamp_stroke_color_default;
   timestamp_stroke_width = timestamp_stroke_width_default;
   timestamp_letter_spacing = timestamp_letter_spacing_default;
+
+  input_path[0] = '\0';
 
   while ((opt = getopt_long(argc, argv, "w:h:v:f:g:c:r:a:o:pq", long_options, &option_index)) != -1) {
     switch (opt) {
@@ -5339,6 +5507,9 @@ int main(int argc, char **argv) {
             }
             search_p = comma_p + 1;
           }
+        } else if (strcmp(long_options[option_index].name, "input") == 0) {
+          strncpy(input_path, optarg, sizeof(input_path) - 1);
+          input_path[sizeof(input_path) - 1] = '\0';
         } else if (strcmp(long_options[option_index].name, "timefontname") == 0) {
           strncpy(timestamp_font_name, optarg, sizeof(timestamp_font_name) - 1);
           timestamp_font_name[sizeof(timestamp_font_name) - 1] = '\0';
@@ -6029,6 +6200,11 @@ int main(int argc, char **argv) {
   if (query_and_exit) {
     query_sensor_mode();
   } else {
+
+    if(input_path[0]) {
+      pthread_create(&input_thread, NULL, input_thread_loop, NULL);
+    }
+
     openmax_cam_loop();
 
     if (disable_audio_capturing) {
@@ -6041,6 +6217,9 @@ int main(int argc, char **argv) {
 
     log_debug("shutdown sequence start\n");
 
+    log_debug("Waiting for input_thread...\n");
+    pthread_join(input_thread, NULL);
+
     if (is_recording) {
       rec_thread_needs_write = 1;
       pthread_cond_signal(&rec_cond);
@@ -6049,13 +6228,17 @@ int main(int argc, char **argv) {
       pthread_join(rec_thread, NULL);
     }
 
-    pthread_mutex_lock(&camera_finish_mutex);
-    // Wait for the camera to finish
-    while (!is_camera_finished) {
-      log_debug("waiting for the camera to finish\n");
-      pthread_cond_wait(&camera_finish_cond, &camera_finish_mutex);
+    if(input_path[0]) {
+      //sleep()
+    } else {
+      pthread_mutex_lock(&camera_finish_mutex);
+      // Wait for the camera to finish
+      while (!is_camera_finished) {
+        log_debug("waiting for the camera to finish\n");
+        pthread_cond_wait(&camera_finish_cond, &camera_finish_mutex);
+      }
+      pthread_mutex_unlock(&camera_finish_mutex);
     }
-    pthread_mutex_unlock(&camera_finish_mutex);
   }
 
   stop_openmax_capturing();
