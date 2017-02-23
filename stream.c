@@ -33,6 +33,9 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/mathematics.h>
 #include <getopt.h>
+#include <linux/videodev2.h>
+
+#include "jpeg.h"
 
 #include "bcm_host.h"
 #include "ilclient.h"
@@ -112,6 +115,453 @@ static const int VIDEO_DECODE_INPUT_PORT  = 130;
 static const int VIDEO_DECODE_OUTPUT_PORT = 131;
 static const int VIDEO_ENCODE_INPUT_PORT  = 200;
 static const int VIDEO_ENCODE_OUTPUT_PORT = 201;
+
+// MJPEG constants
+
+extern const uint8_t avpriv_mjpeg_bits_dc_luminance[];
+extern const uint8_t avpriv_mjpeg_val_dc[];
+
+extern const uint8_t avpriv_mjpeg_bits_dc_chrominance[];
+
+extern const uint8_t avpriv_mjpeg_bits_ac_luminance[];
+extern const uint8_t avpriv_mjpeg_val_ac_luminance[];
+
+extern const uint8_t avpriv_mjpeg_bits_ac_chrominance[];
+extern const uint8_t avpriv_mjpeg_val_ac_chrominance[];
+
+static const uint8_t jpeg_header[] = {
+    0xff, 0xd8,                     // SOI
+    0xff, 0xe0,                     // APP0
+    0x00, 0x10,                     // APP0 header size (including
+                                    // this field, but excluding preceding)
+    0x4a, 0x46, 0x49, 0x46, 0x00,   // ID string 'JFIF\0'
+    0x01, 0x01,                     // version
+    0x00,                           // bits per type
+    0x00, 0x00,                     // X density
+    0x00, 0x00,                     // Y density
+    0x00,                           // X thumbnail size
+    0x00,                           // Y thumbnail size
+};
+
+static const int dht_segment_size = 420;
+static const uint8_t dht_segment_head[] = { 0xFF, 0xC4, 0x01, 0xA2, 0x00 };
+static const uint8_t dht_segment_frag[] = {
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+    0x0a, 0x0b, 0x01, 0x00, 0x03, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+static uint8_t *append(uint8_t *buf, const uint8_t *src, int size)
+{
+    memcpy(buf, src, size);
+    return buf + size;
+}
+
+static uint8_t *append_dht_segment(uint8_t *buf)
+{
+    buf = append(buf, dht_segment_head, sizeof(dht_segment_head));
+    buf = append(buf, avpriv_mjpeg_bits_dc_luminance + 1, 16);
+    buf = append(buf, dht_segment_frag, sizeof(dht_segment_frag));
+    buf = append(buf, avpriv_mjpeg_val_dc, 12);
+    *(buf++) = 0x10;
+    buf = append(buf, avpriv_mjpeg_bits_ac_luminance + 1, 16);
+    buf = append(buf, avpriv_mjpeg_val_ac_luminance, 162);
+    *(buf++) = 0x11;
+    buf = append(buf, avpriv_mjpeg_bits_ac_chrominance + 1, 16);
+    buf = append(buf, avpriv_mjpeg_val_ac_chrominance, 162);
+    return buf;
+}
+
+// V4L METHODS
+
+#define CLEAR(x) memset(&(x), 0, sizeof(x))
+
+#ifndef V4L2_PIX_FMT_H264
+#define V4L2_PIX_FMT_H264     v4l2_fourcc('H', '2', '6', '4') /* H264 with start codes */
+#endif
+
+struct v4l_buffer {
+        void   *start;
+        size_t  length;
+};
+
+#define JPEG_MAX_SIZE 512*1024
+
+static const char      *v4l_dev_name = "/dev/video0";
+static int              v4l_fd = -1;
+struct v4l_buffer      *v4l_buffers;
+static unsigned int     v4l_n_buffers;
+//static int              v4l_out_buf;
+static int              v4l_force_format = 0;
+static int              v4l_frame_number = 0;
+static uint8_t          v4l_last_frame[JPEG_MAX_SIZE]; // max 1mb jpeg seems reasonable
+static int              v4l_last_frame_size = 0;
+
+static void errno_exit(const char *s)
+{
+        log_fatal("%s error %d, %s\n", s, errno, strerror(errno));
+        exit(EXIT_FAILURE);
+}
+
+static int xioctl(int fh, int request, void *arg)
+{
+        int r;
+        do {
+                r = ioctl(fh, request, arg);
+        } while (-1 == r && EINTR == errno);
+        return r;
+}
+
+static void v4l_process_image(const void *p, int size)
+{
+	int input_skip;
+	uint8_t *out, *in;
+
+	in = p;
+  v4l_last_frame_size = 0;
+
+	if(in[0] != 0xff || in[1] != 0xd8) {
+		log_error("Frame is not a jpeg (drop)\n");
+		return;
+	}
+
+	if(in[2] == 0xff &&  in[3] == APP0) {
+		input_skip = (in[4] << 8) + in[5] + 4;
+		//printf("type is App0, input skip = %d\n", input_skip);
+	} else {
+		log_error("JPEG Type is not App0 (drop)\n");
+		return;
+	}
+
+	if(size < input_skip) {
+		log_error("JPEG is truncated (drop)\n");
+		return;
+	}
+
+	v4l_last_frame_size = size - input_skip + sizeof(jpeg_header) + dht_segment_size;
+
+	//printf("Input size: %d bytes, output: %d bytes\n", size, output_size);
+
+  if(v4l_last_frame_size > JPEG_MAX_SIZE) {
+    log_error("Next jpeg is too large, dropping\n");
+    v4l_last_frame_size = 0;
+    return;
+  }
+
+	out = v4l_last_frame;
+
+	out = append(out, jpeg_header, sizeof(jpeg_header));
+	out = append_dht_segment(out);
+	out = append(out, in + input_skip, size - input_skip);
+
+  v4l_frame_number++;
+
+  //log_debug("Wrote %d bytes to last v4l frame\n", v4l_last_frame_size);
+/*        char filename[15];
+        sprintf(filename, "frame-%d.raw", frame_number);
+        FILE *fp=fopen(filename,"wb");
+
+	fwrite(p, size, 1, fp);
+
+        fflush(fp);
+        fclose(fp);
+
+	sprintf(filename, "frame-%d.jpg", frame_number);
+	fp = fopen(filename, "wb");
+*/
+	//fwrite(output_buf, output_size, 1, stdout);
+
+//	fclose(fp);
+}
+
+static int v4l_read_frame(void)
+{
+  struct v4l2_buffer buf;
+
+  CLEAR(buf);
+
+  buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  buf.memory = V4L2_MEMORY_MMAP;
+
+  if (-1 == xioctl(v4l_fd, VIDIOC_DQBUF, &buf)) {
+    switch (errno) {
+      case EAGAIN:
+      return 0;
+
+      case EIO:
+      /* Could ignore EIO, see spec. */
+
+      /* fall through */
+
+      default:
+      errno_exit("VIDIOC_DQBUF");
+    }
+  }
+
+  assert(buf.index < v4l_n_buffers);
+
+  v4l_process_image(v4l_buffers[buf.index].start, buf.bytesused);
+
+  if (-1 == xioctl(v4l_fd, VIDIOC_QBUF, &buf))
+    errno_exit("VIDIOC_QBUF");
+
+  return v4l_last_frame_size;
+}
+
+static void v4l_get_single_frame(void)
+{
+  for (;;) {
+    fd_set fds;
+    struct timeval tv;
+    int r;
+
+    FD_ZERO(&fds);
+    FD_SET(v4l_fd, &fds);
+
+    /* Timeout. */
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+
+    r = select(v4l_fd + 1, &fds, NULL, NULL, &tv);
+
+    if (-1 == r) {
+      if (EINTR == errno)
+      continue;
+      errno_exit("select");
+    }
+
+    if (0 == r) {
+      fprintf(stderr, "select timeout\n");
+      exit(EXIT_FAILURE);
+    }
+
+    if (v4l_read_frame())
+    break;
+    /* EAGAIN - continue select loop. */
+  }
+}
+
+static void v4l_stop_capturing(void)
+{
+  enum v4l2_buf_type type;
+
+  type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (-1 == xioctl(v4l_fd, VIDIOC_STREAMOFF, &type))
+  errno_exit("VIDIOC_STREAMOFF");
+}
+
+static void v4l_start_capturing(void)
+{
+  unsigned int i;
+  enum v4l2_buf_type type;
+
+  for (i = 0; i < v4l_n_buffers; ++i) {
+    struct v4l2_buffer buf;
+
+    CLEAR(buf);
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = i;
+
+    if (-1 == xioctl(v4l_fd, VIDIOC_QBUF, &buf))
+    errno_exit("VIDIOC_QBUF");
+  }
+  type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (-1 == xioctl(v4l_fd, VIDIOC_STREAMON, &type))
+  errno_exit("VIDIOC_STREAMON");
+}
+
+static void v4l_uninit_device(void)
+{
+  unsigned int i;
+
+  for (i = 0; i < v4l_n_buffers; ++i)
+  if (-1 == munmap(v4l_buffers[i].start, v4l_buffers[i].length))
+  errno_exit("munmap");
+
+  free(v4l_buffers);
+}
+
+static void v4l_init_mmap(void)
+{
+  struct v4l2_requestbuffers req;
+
+  CLEAR(req);
+
+  req.count = 4;
+  req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  req.memory = V4L2_MEMORY_MMAP;
+
+  if (-1 == xioctl(v4l_fd, VIDIOC_REQBUFS, &req)) {
+    if (EINVAL == errno) {
+      fprintf(stderr, "%s does not support "
+      "memory mapping\n", v4l_dev_name);
+      exit(EXIT_FAILURE);
+    } else {
+      errno_exit("VIDIOC_REQBUFS");
+    }
+  }
+
+  if (req.count < 2) {
+    fprintf(stderr, "Insufficient buffer memory on %s\n",
+    v4l_dev_name);
+    exit(EXIT_FAILURE);
+  }
+
+  v4l_buffers = calloc(req.count, sizeof(*v4l_buffers));
+
+  if (!v4l_buffers) {
+    fprintf(stderr, "Out of memory\n");
+    exit(EXIT_FAILURE);
+  }
+
+  for (v4l_n_buffers = 0; v4l_n_buffers < req.count; ++v4l_n_buffers) {
+    struct v4l2_buffer buf;
+
+    CLEAR(buf);
+
+    buf.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory      = V4L2_MEMORY_MMAP;
+    buf.index       = v4l_n_buffers;
+
+    if (-1 == xioctl(v4l_fd, VIDIOC_QUERYBUF, &buf))
+    errno_exit("VIDIOC_QUERYBUF");
+
+    v4l_buffers[v4l_n_buffers].length = buf.length;
+    v4l_buffers[v4l_n_buffers].start =
+    mmap(NULL /* start anywhere */,
+      buf.length,
+      PROT_READ | PROT_WRITE /* required */,
+      MAP_SHARED /* recommended */,
+      v4l_fd, buf.m.offset);
+
+      if (MAP_FAILED == v4l_buffers[v4l_n_buffers].start)
+      errno_exit("mmap");
+    }
+}
+
+static void v4l_init_device(void)
+{
+  struct v4l2_capability cap;
+  struct v4l2_cropcap cropcap;
+  struct v4l2_crop crop;
+  struct v4l2_format fmt;
+  unsigned int min;
+
+  if (-1 == xioctl(v4l_fd, VIDIOC_QUERYCAP, &cap)) {
+    if (EINVAL == errno) {
+      fprintf(stderr, "%s is no V4L2 device\n",
+      v4l_dev_name);
+      exit(EXIT_FAILURE);
+    } else {
+      //errno_exit("VIDIOC_QUERYCAP");
+      log_fatal("V4L Device init error");
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+    fprintf(stderr, "%s is no video capture device\n",
+    v4l_dev_name);
+    exit(EXIT_FAILURE);
+  }
+
+
+  if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
+    fprintf(stderr, "%s does not support streaming i/o\n",
+    v4l_dev_name);
+    exit(EXIT_FAILURE);
+  }
+
+  /* Select video input, video standard and tune here. */
+
+
+  CLEAR(cropcap);
+
+  cropcap.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+  if (0 == xioctl(v4l_fd, VIDIOC_CROPCAP, &cropcap)) {
+    crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    crop.c = cropcap.defrect; /* reset to default */
+
+    if (-1 == xioctl(v4l_fd, VIDIOC_S_CROP, &crop)) {
+      switch (errno) {
+        case EINVAL:
+        /* Cropping not supported. */
+        break;
+        default:
+        /* Errors ignored. */
+        break;
+      }
+    }
+  } else {
+    /* Errors ignored. */
+  }
+
+
+  CLEAR(fmt);
+
+  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  if (v4l_force_format) {
+    // TODO
+    fprintf(stderr, "Set H264\r\n");
+    fmt.fmt.pix.width       = 640; //replace
+    fmt.fmt.pix.height      = 480; //replace
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_H264; //replace
+    fmt.fmt.pix.field       = V4L2_FIELD_ANY;
+
+    if (-1 == xioctl(v4l_fd, VIDIOC_S_FMT, &fmt))
+    errno_exit("VIDIOC_S_FMT");
+
+    /* Note VIDIOC_S_FMT may change width and height. */
+  } else {
+    /* Preserve original settings as set by v4l2-ctl for example */
+    if (-1 == xioctl(v4l_fd, VIDIOC_G_FMT, &fmt))
+    errno_exit("VIDIOC_G_FMT");
+  }
+
+  /* Buggy driver paranoia. */
+  min = fmt.fmt.pix.width * 2;
+  if (fmt.fmt.pix.bytesperline < min)
+  fmt.fmt.pix.bytesperline = min;
+  min = fmt.fmt.pix.bytesperline * fmt.fmt.pix.height;
+  if (fmt.fmt.pix.sizeimage < min)
+  fmt.fmt.pix.sizeimage = min;
+
+  v4l_init_mmap();
+}
+
+static void v4l_close_device(void)
+{
+  if (-1 == close(v4l_fd))
+  errno_exit("close");
+
+  v4l_fd = -1;
+}
+
+static void v4l_open_device(void)
+{
+  struct stat st;
+
+  if (-1 == stat(v4l_dev_name, &st)) {
+    fprintf(stderr, "Cannot identify '%s': %d, %s\n",
+    v4l_dev_name, errno, strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+
+  if (!S_ISCHR(st.st_mode)) {
+    fprintf(stderr, "%s is no device\n", v4l_dev_name);
+    exit(EXIT_FAILURE);
+  }
+
+  v4l_fd = open(v4l_dev_name, O_RDWR /* required */ | O_NONBLOCK, 0);
+
+  if (-1 == v4l_fd) {
+    fprintf(stderr, "Cannot open '%s': %d, %s\n",
+    v4l_dev_name, errno, strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+}
 
 // Directory to put recorded MPEG-TS files
 static char *rec_dir = "rec";
@@ -2801,7 +3251,7 @@ static void shutdown_openmax() {
 
   // Disable port buffers
   if(input_path[0]) {
-    log_debug("shutdown_openmax: disable port buffer for camera %d\n", VIDEO_ENCODE_INPUT_PORT);
+    log_debug("shutdown_openmax: disable port 2 buffers for video_decode %d\n", VIDEO_ENCODE_INPUT_PORT);
     ilclient_disable_port_buffers(video_decode, VIDEO_ENCODE_INPUT_PORT, NULL, NULL, NULL);
     ilclient_disable_port_buffers(video_decode, VIDEO_ENCODE_OUTPUT_PORT, NULL, NULL, NULL);
   } else {
@@ -3358,7 +3808,7 @@ static int openmax_cam_open() {
     cam_def.format.video.nFrameHeight = video_height;
     cam_def.format.video.eCompressionFormat = OMX_VIDEO_CodingMJPEG;
     cam_def.format.video.bFlagErrorConcealment = 0;
-    cam_def.nBufferSize = 256*1024;
+    cam_def.nBufferSize = JPEG_MAX_SIZE;
 
     // Set input port def
     error = OMX_SetParameter(ILC_GET_HANDLE(video_decode),
@@ -4545,11 +4995,11 @@ static void openmax_cam_loop() {
 
 static void *input_thread_loop() {
   struct timespec ts;
-  int ret, k, size, offset, i, ff, end_buf, got_frame;
+  int ret, size, i, end_buf, need_frame;
   OMX_BUFFERHEADERTYPE *buf;
   OMX_ERRORTYPE error;
   unsigned char test_jpeg[200000];
-  char sinbuf[STDIN_BUFSIZE+1] = {0};
+//  char sinbuf[STDIN_BUFSIZE+1] = {0};
   FILE *testFile;
 
   testFile = fopen(input_path, "rb");
@@ -4564,12 +5014,20 @@ static void *input_thread_loop() {
   } else {
     exit(EXIT_FAILURE);
   }
-  offset = 0;
-  end_buf = 0;
   i = 0;
-  ff = 0;
 
   log_debug("input_loop() forked, using: %s\n", input_path);
+
+  v4l_open_device();
+  v4l_init_device();
+  v4l_start_capturing();
+
+  log_debug("V4L device opened: %s\n", v4l_dev_name);
+
+  v4l_get_single_frame();
+  need_frame = 0;
+
+  log_debug("Seeded first frame\n");
 
   while (keepRunning || !is_camera_finished) {
     if (input_capture) {
@@ -4580,6 +5038,18 @@ static void *input_thread_loop() {
       }
 
       buf->nFlags = i++ == 0 ? OMX_BUFFERFLAG_STARTTIME : 0;
+      buf->nFlags |= OMX_BUFFERFLAG_ENDOFFRAME;
+
+      if(v4l_last_frame_size > buf->nAllocLen) {
+          log_error("JPEG was too big for single decode buffer\n");
+          exit(EXIT_FAILURE);
+      } else {
+        memcpy(buf->pBuffer, v4l_last_frame, v4l_last_frame_size);
+        buf->nFilledLen = v4l_last_frame_size;
+      }
+
+      need_frame = 1;
+      /*
       k = 0;
       got_frame = 0;
 
@@ -4611,7 +5081,7 @@ static void *input_thread_loop() {
       dump_frame:
 
       //log_debug("Writing jpeg buffer %d bytes\n", k);
-      buf->nFilledLen = k;
+      buf->nFilledLen = k;*/
 /*
       if(need_more_data) {
         chars_read = fread(sinbuf, 1, STDIN_BUFSIZE, stdin);
@@ -4631,9 +5101,14 @@ static void *input_thread_loop() {
       if (error != OMX_ErrorNone) {
         log_error("error emptying buffer: 0x%x\n", error);
       }
+
+      if(need_frame) {
+        v4l_get_single_frame();
+        need_frame = 0;
+      }
       // sleep 100ms
       ts.tv_sec = 0;
-      ts.tv_nsec = 17000000;
+      ts.tv_nsec = 25000000;
       ret = clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
       if (ret != 0) {
         log_error("nanosleep error:%d\n", ret);
@@ -4641,6 +5116,9 @@ static void *input_thread_loop() {
     }
   }
   log_debug("input loop ending\n");
+  v4l_stop_capturing();
+  v4l_uninit_device();
+  v4l_close_device();
   pthread_exit(0);
 }
 
@@ -6165,7 +6643,7 @@ int main(int argc, char **argv) {
     if (is_hlsout_enabled) {
       hls->dir = hls_output_dir;
       hls->target_duration = 1;
-      hls->num_retained_old_files = 10;
+      hls->num_retained_old_files = 60;
       if (is_hls_encryption_enabled) {
         hls->use_encryption = 1;
 
@@ -6271,7 +6749,7 @@ int main(int argc, char **argv) {
     }
 
     if(input_path[0]) {
-      //sleep()
+      sleep(2);
     } else {
       pthread_mutex_lock(&camera_finish_mutex);
       // Wait for the camera to finish
