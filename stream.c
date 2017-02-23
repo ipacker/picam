@@ -185,6 +185,8 @@ struct v4l_buffer {
         size_t  length;
 };
 
+static int keepRunning = 1;
+
 #define JPEG_MAX_SIZE 512*1024
 
 static const char      *v4l_dev_name = "/dev/video0";
@@ -318,7 +320,7 @@ static void v4l_get_single_frame(void)
     FD_ZERO(&fds);
     FD_SET(v4l_fd, &fds);
 
-    /* Timeout. */
+    /* Timeout 2 seconds then exit */
     tv.tv_sec = 2;
     tv.tv_usec = 0;
 
@@ -331,8 +333,8 @@ static void v4l_get_single_frame(void)
     }
 
     if (0 == r) {
-      fprintf(stderr, "select timeout\n");
-      exit(EXIT_FAILURE);
+      log_fatal("V4L select timeout - sending stop\n");
+      keepRunning = 0;
     }
 
     if (v4l_read_frame())
@@ -875,11 +877,13 @@ static int disable_audio_capturing = 0;
 
 static pthread_t audio_nop_thread;
 static pthread_t input_thread;
+static pthread_t shutdown_guarantee_thread;
 
 
 static int fr_q16;
 
 // Function prototypes
+//void stopSignalHandler(int signo);
 static int camera_set_white_balance(char *wb);
 static int camera_set_exposure_control(char *ex);
 static int camera_set_custom_awb_gains();
@@ -922,7 +926,6 @@ static pthread_mutex_t tcp_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int current_exposure_mode = EXPOSURE_AUTO;
 
-static int keepRunning = 1;
 static int frame_count = 0;
 static int current_audio_frames = 0;
 static uint8_t *codec_configs[2];
@@ -3504,6 +3507,7 @@ static void cam_fill_buffer_done(void *data, COMPONENT_T *comp) {
             log_debug(".");
             timestamp_update();
             subtitle_update();
+            draw_mar_overlay(last_video_buffer, video_width_32, video_height_16, 1);
             int is_text_changed = text_draw_all(last_video_buffer, video_width_32, video_height_16, 1); // is_video = 1
             if (is_text_changed && is_preview_enabled) {
               // the text has actually changed, redraw preview subtitle overlay
@@ -3529,6 +3533,9 @@ static void cam_fill_buffer_done(void *data, COMPONENT_T *comp) {
       log_error("error filling camera buffer (2): 0x%x\n", error);
     }
   } else {
+
+    log_debug("Shutting down - returning encoder buffer\n");
+
     // Return the buffer (without this, ilclient_disable_port_buffers will hang)
     error = OMX_FillThisBuffer(ILC_GET_HANDLE(comp), out);
     if (error != OMX_ErrorNone) {
@@ -3536,8 +3543,11 @@ static void cam_fill_buffer_done(void *data, COMPONENT_T *comp) {
     }
 
     // Clear the callback
+    log_debug("Shutting down - clear callback\n");
     ilclient_set_fill_buffer_done_callback(cam_client, NULL, 0);
 
+
+    log_debug("Shutting down - clear pBuffer hack\n");
 #if ENABLE_PBUFFER_OPTIMIZATION_HACK
     // Revert pBuffer value of video_encode input buffer
     if (video_encode_input_buf != NULL) {
@@ -3546,6 +3556,7 @@ static void cam_fill_buffer_done(void *data, COMPONENT_T *comp) {
     }
 #endif
 
+    log_debug("Shutting down - notify main thread and exit\n");
     // Notify the main thread that the camera is stopped
     pthread_mutex_lock(&camera_finish_mutex);
     is_camera_finished = 1;
@@ -4991,16 +5002,89 @@ static void openmax_cam_loop() {
   }
 }
 
+static void *shutdown_guarantee() {
+  sleep(2);
+  log_fatal("Clean shutdown failed");
+  exit(EXIT_FAILURE);
+}
+
+static int file_to_buffer(uint8_t *theBuffer, int limit, char* file)
+{
+  FILE *theFile;
+  int size = 0;
+
+  if(!file || !theBuffer)
+    return 0;
+
+  theFile = fopen(file, "rb");
+  if (theFile)
+  {
+    fseek(theFile, 0, SEEK_END);
+    size = ftell(theFile);
+    if(size > limit) {
+        log_error("Couldn't load %s (too big)", file);
+        return 0;
+    }
+    fseek(theFile, 0, SEEK_SET);
+    fread(theBuffer, size, 1, theFile);
+    log_debug("Read %d bytes from %s into buffer\n", size, input_path);
+    fclose(theFile);
+  } else {
+    log_error("Couldn't read file: %s\n", input_path);
+  }
+  return size;
+}
+
+  //yuvMAR is 64x64
+static uint8_t yuvMAR[16*1024];
+static int yuvMAR_w = 64;
+static int yuvMAR_h = 64;
+static int overlay_x = 0;
+static int overlay_y = 0;
+
+int draw_mar_overlay(uint8_t *canvas, int canvas_width,
+  int canvas_height, int is_video)
+{
+  int i, k;
+  int slice1 = canvas_width*canvas_height;
+  int slice2 = slice1 + slice1/4;
+  int cw2 = canvas_width/2;
+  int ch2 = canvas_height/2;
+  int yuvMARslice = yuvMAR_w*yuvMAR_h;
+
+  for(i = 0; i < yuvMAR_h; i++) {
+      memcpy(&canvas[(i+overlay_y)*canvas_width+overlay_x],
+        &yuvMAR[i*yuvMAR_w], yuvMAR_w);
+
+      if(i%2 == 0) {
+          memcpy(&canvas[slice1 + (((i+overlay_y)/2)*cw2) + (overlay_x/2)],
+            &yuvMAR[yuvMARslice + (16*i)],
+            yuvMAR_w/2);
+
+          memcpy(&canvas[slice2 + (((i+overlay_y)/2)*cw2) + (overlay_x/2)],
+            &yuvMAR[yuvMARslice + (yuvMARslice/4) + (16*i)],
+            yuvMAR_w/2);
+      }
+  }
+
+  if(overlay_x++ > 500) overlay_x = 0;
+  if(overlay_y++ > 500) overlay_y = 0;
+
+  return 0;
+}
+
 #define STDIN_BUFSIZE 2048*1024
 
 static void *input_thread_loop() {
   struct timespec ts;
-  int ret, size, i, end_buf, need_frame;
+  int ret, size, i, need_frame;
   OMX_BUFFERHEADERTYPE *buf;
   OMX_ERRORTYPE error;
-  unsigned char test_jpeg[200000];
+  unsigned char test_jpeg[256000];
 //  char sinbuf[STDIN_BUFSIZE+1] = {0};
   FILE *testFile;
+
+  file_to_buffer(yuvMAR, 128*1024, "/raspimar/splash/smallmar.yuv");
 
   testFile = fopen(input_path, "rb");
   if (testFile)
@@ -5012,7 +5096,8 @@ static void *input_thread_loop() {
     log_debug("Read %d bytes from %s into jpeg buffer\n", size, input_path);
     fclose(testFile);
   } else {
-    exit(EXIT_FAILURE);
+    log_error("Couldn't read jpeg: %s\n", input_path);
+    //exit(EXIT_FAILURE);
   }
   i = 0;
 
@@ -6750,6 +6835,7 @@ int main(int argc, char **argv) {
 
     if(input_path[0]) {
       sleep(2);
+      pthread_create(&shutdown_guarantee_thread, NULL, shutdown_guarantee, NULL);
     } else {
       pthread_mutex_lock(&camera_finish_mutex);
       // Wait for the camera to finish

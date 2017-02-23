@@ -361,7 +361,7 @@ HTTPLiveStreaming *_hls_create(int num_recent_files, int is_audio_only, MpegTSCo
   }
   hls->is_audio_only = is_audio_only;
   hls->format_ctx = format_ctx;
-  hls->index_filename = "index.m3u8";
+  hls->index_filename = "record.m3u8";
   hls->num_recent_files = num_recent_files;
   hls->num_retained_old_files = 10;
   hls->most_recent_number = 0;
